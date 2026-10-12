@@ -87,6 +87,7 @@ class TestLogGuard(unittest.TestCase):
         normal_log = os.path.join(temp_watch, "small.log")
         with open(normal_log, "w") as f:
             f.write("OK\n")
+        normal_size = os.path.getsize(normal_log)
 
         other_file = os.path.join(temp_watch, "large.data")
         with open(other_file, "w") as f:
@@ -98,7 +99,7 @@ class TestLogGuard(unittest.TestCase):
         self.assertGreaterEqual(freed, file_size)
         self.assertTrue(os.path.exists(oversized_log))
         self.assertEqual(os.path.getsize(oversized_log), 0)
-        self.assertEqual(os.path.getsize(normal_log), 3)
+        self.assertEqual(os.path.getsize(normal_log), normal_size)
         self.assertEqual(os.path.getsize(other_file), 2000)
 
     def test_clean_runaway_temp_logs_windows_locked_skip(self):
