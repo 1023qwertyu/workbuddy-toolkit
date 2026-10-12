@@ -41,3 +41,4 @@ Icon
 *.swo
 *~
 .agents/
+.codegraph/

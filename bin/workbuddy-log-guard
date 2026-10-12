@@ -28,7 +28,9 @@ def load_config():
         "sessions_ttl_hours": 72,   # 3 days
         "max_sessions_keep": 10,    # Max active sessions to retain
         "heal_seatbelt_rules": True, # Auto-inject temp rules into sandbox-center
-        "reap_orphaned_daemons": True # Clean up orphaned daemons when GUI is closed
+        "reap_orphaned_daemons": True, # Clean up orphaned daemons when GUI is closed
+        "max_temp_file_mb": 500,     # Runaway temp log max 500MB
+        "bundle_migration_ttl_hours": 72 # Stale bundle migration TTL 72 hours
     }
     # Env var overrides
     if "WB_TTL_MINUTES" in os.environ:
@@ -47,6 +49,11 @@ def load_config():
         config["heal_seatbelt_rules"] = os.environ["WB_HEAL_SEATBELT_RULES"].lower() in ("1", "true", "yes")
     if "WB_REAP_ORPHANED_DAEMONS" in os.environ:
         config["reap_orphaned_daemons"] = os.environ["WB_REAP_ORPHANED_DAEMONS"].lower() in ("1", "true", "yes")
+    if "WB_MAX_TEMP_FILE_MB" in os.environ:
+        config["max_temp_file_mb"] = float(os.environ["WB_MAX_TEMP_FILE_MB"])
+    if "WB_BUNDLE_MIGRATION_TTL_HOURS" in os.environ:
+        config["bundle_migration_ttl_hours"] = int(os.environ["WB_BUNDLE_MIGRATION_TTL_HOURS"])
+
 
     if os.path.exists(CONFIG_FILE):
         try:
@@ -212,7 +219,134 @@ def clean_shell_snapshots(snapshots_dir, ttl_hours=72):
                 pass
     return cleaned
 
+def clean_runaway_temp_logs(temp_dirs=None, max_temp_file_mb=500, log_extensions=(".log", ".txt", ".out", ".err")):
+    """
+    Surgically truncates runaway log files in temporary directories (e.g. /tmp, /private/tmp).
+    Only targets regular files owned by current user matching log extensions/patterns that exceed max_temp_file_mb.
+    Applies truncate_file() in-place to release disk blocks without deleting or breaking active file descriptors.
+    Cross-platform safe: skips Windows files if exclusive lock is held.
+    """
+    if temp_dirs is None:
+        dirs_to_check = []
+        if "WB_TMP_DIR" in os.environ:
+            dirs_to_check.append(os.environ["WB_TMP_DIR"])
+        import tempfile
+        sys_tmp = tempfile.gettempdir()
+        if sys_tmp and sys_tmp not in dirs_to_check:
+            dirs_to_check.append(sys_tmp)
+        for standard_tmp in ["/tmp", "/private/tmp"]:
+            if os.path.exists(standard_tmp) and standard_tmp not in dirs_to_check:
+                dirs_to_check.append(standard_tmp)
+    else:
+        dirs_to_check = list(temp_dirs)
+
+    cleaned_count = 0
+    freed_bytes = 0
+    max_bytes = int(max_temp_file_mb * 1024 * 1024)
+    current_uid = os.getuid() if hasattr(os, "getuid") else None
+
+    # Track already scanned paths to prevent duplicate processing if /tmp -> /private/tmp symlink
+    scanned_realpaths = set()
+
+    for t_dir in dirs_to_check:
+        if not os.path.exists(t_dir) or not os.path.isdir(t_dir):
+            continue
+        try:
+            entries = os.listdir(t_dir)
+        except Exception:
+            continue
+
+        for item in entries:
+            fp = os.path.join(t_dir, item)
+            # Must be a regular file, skip directories and symlinks
+            if not os.path.isfile(fp) or os.path.islink(fp):
+                continue
+
+            real_fp = os.path.realpath(fp)
+            if real_fp in scanned_realpaths:
+                continue
+            scanned_realpaths.add(real_fp)
+
+            # Check filename extension or runaway log keyword
+            item_lower = item.lower()
+            is_log_candidate = any(item_lower.endswith(ext) for ext in log_extensions) or \
+                               any(kw in item_lower for kw in ("-fail", "-crash", "-err", "_fail", "_crash"))
+            if not is_log_candidate:
+                continue
+
+            try:
+                st = os.stat(fp)
+                # Ensure ownership: only clean files owned by current user
+                if current_uid is not None and st.st_uid != current_uid:
+                    continue
+
+                if st.st_size > max_bytes:
+                    # On Windows, check if file is locked
+                    if os.name == 'nt' and is_file_open(fp, set()):
+                        continue
+
+                    original_size = st.st_size
+                    if truncate_file(fp):
+                        freed_bytes += original_size
+                        cleaned_count += 1
+                        print(f"[LOG_GUARD] Truncated runaway temp log: {fp} ({original_size / (1024*1024):.1f} MB)", file=sys.stderr)
+            except Exception:
+                pass
+
+    return cleaned_count, freed_bytes
+
+
+def clean_bundle_migration_cache(bundle_migration_dir=None, ttl_hours=72):
+    """
+    Cleans up stale WorkBuddy bundle update backups and downloads in ~/Library/Caches/com.tencent.workbuddy.mac.BundleMigration.
+    Only removes items older than ttl_hours (default: 72h / 3 days) to prevent disk exhaustion.
+    """
+    if bundle_migration_dir is None:
+        bm_dir = os.path.expanduser("~/Library/Caches/com.tencent.workbuddy.mac.BundleMigration")
+    else:
+        bm_dir = bundle_migration_dir
+
+    if not os.path.exists(bm_dir):
+        return 0, 0
+
+    now = time.time()
+    ttl_seconds = ttl_hours * 3600
+    cleaned_count = 0
+    freed_bytes = 0
+
+    # Subdirectories that store large binaries: backups, downloads, extracted
+    subdirs = ["backups", "downloads", "extracted"]
+    for sub in subdirs:
+        sub_path = os.path.join(bm_dir, sub)
+        if not os.path.exists(sub_path):
+            continue
+        try:
+            items = os.listdir(sub_path)
+        except Exception:
+            continue
+
+        for item in items:
+            item_path = os.path.join(sub_path, item)
+            try:
+                mtime = os.path.getmtime(item_path)
+                if now - mtime > ttl_seconds:
+                    if os.path.isdir(item_path):
+                        sz = get_dir_size(item_path)
+                        shutil.rmtree(item_path, ignore_errors=True)
+                        freed_bytes += sz
+                        cleaned_count += 1
+                    elif os.path.isfile(item_path):
+                        sz = os.path.getsize(item_path)
+                        if remove_file(item_path):
+                            freed_bytes += sz
+                            cleaned_count += 1
+            except Exception:
+                pass
+
+    return cleaned_count, freed_bytes
+
 def find_sandbox_center_socket(socket_dir=None):
+
     """
     Locates active sandbox-center Unix domain socket.
     """
@@ -909,5 +1043,20 @@ def main():
         except Exception:
             pass
 
+    # 10. Clean runaway temp logs (default cap: 500MB)
+    try:
+        max_temp_mb = config.get("max_temp_file_mb", 500)
+        clean_runaway_temp_logs(max_temp_file_mb=max_temp_mb)
+    except Exception:
+        pass
+
+    # 11. Clean stale WorkBuddy bundle migration update caches (>72h)
+    try:
+        bm_ttl = config.get("bundle_migration_ttl_hours", 72)
+        clean_bundle_migration_cache(ttl_hours=bm_ttl)
+    except Exception:
+        pass
+
 if __name__ == "__main__":
     main()
+
