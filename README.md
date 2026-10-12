@@ -2,7 +2,7 @@
 
 [![CI: Cross-Platform Matrix](https://github.com/FlapPearLabs/workbuddy-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit/actions/workflows/ci.yml)
 [![Release: v0.6.0](https://img.shields.io/badge/Release-v0.6.0-blue.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit)
-[![Tests: 101/101 Passed](https://img.shields.io/badge/Tests-101%2F101%20Passed-brightgreen.svg)](tests/)
+[![Tests: 130/130 Passed](https://img.shields.io/badge/Tests-130%2F130%20Passed-brightgreen.svg)](tests/)
 [![Security: Zero-Leak](https://img.shields.io/badge/Security-Zero--Leak%20Audit%20Passed-success.svg)](.github/workflows/ci.yml)
 [![Platform: macOS | Linux | Windows](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-brightgreen.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit)
 [![Python: 3.8+](https://img.shields.io/badge/Python-3.8+-green.svg)](https://python.org)
@@ -65,6 +65,7 @@
 | **模型容灾与自愈** | 官方上游模型故障/限流直接报错中断任务 | **透明容灾轮换网关 (`wb-router`)**：`:8047` 代理中介，支持 DeepSeek / Space Bunny / Hy3 瞬态故障自动降级轮换 |
 | **模型资产透视** | 官方隐藏模型实际扣费倍率与调用计费明细 | **动态全景资产透视 (`wb-models`)**：动态拉取全量模型、实时倍率审计与轻量级交互式终端选择器 (TUI) |
 | **沙盒日志暴走** | sandbox-core 狂写 PTY 日志无淘汰机制，几天吞噬 15GB+ 磁盘 | **智能物理看门狗 (`workbuddy-log-guard`)**：36h TTL、2GB 目录硬顶、30MB 物理熔断，`lsof` 句柄感知，只 truncate 不删活动文件 |
+| **全域临时日志与更新积压** | 测试死循环在 `/tmp` 狂倾 50GB 吞噬系统盘；`BundleMigration` 积压数 GB 历史更新包 | **全域应急熔断与更新缓存清理**：500MB 原位截断熔断器 (`clean_runaway_temp_logs`) 释放磁盘且不崩进程；72h 定向回收 `BundleMigration` 升级包 |
 | **规则雪崩与并发撕裂** | 漏配临时目录导致 1.7 万行规则膨胀卡死 120s SIGKILL；多进程并发自愈易破坏规则文件 | **Single-Flight 内核锁防撕裂 (`wb-sandbox heal`)**：动态通配规则降至 48 条，跨进程排他锁 (`fcntl.flock` / `msvcrt`) + 锁内回读校验，并发 0 冲突 |
 | **IPC 慢连接与头阻塞** | 传统 IPC 无全局超时与帧长限制，遇慢响应或超长 Payload 拖死命令执行 | **全链路 Monotonic Deadline + 4MB 硬熔断**：覆盖连接、发送与分片接收全时钟周期，100% Fail-Open 绝不卡死用户命令 |
 | **子进程与转储隔离** | 子进程默认继承父进程打开句柄；意外崩溃转储 (Core Dump) 泄露内存解密 Token | **物理沙盒隔离 (`close_fds=True` + `RLIMIT_CORE=0`)**：全闭关句柄，POSIX 下锁定 `RLIMIT_CORE=0` 与私有 `umask(0o077)`，物理阻断泄露 |
@@ -581,24 +582,28 @@ WorkBuddy 的 `sandbox-core` 组件负责管理每个独立沙盒进程与交互
 - 单日产生的日志量即可高达 **5 ~ 7 GB**；
 - 运行 3~4 天即可堆积 **15 GB 以上的纯垃圾日志**，直接将本就不宽裕的系统盘彻底吞干！
 
-#### (2) 四重物理防御网 (`workbuddy-log-guard`)
+#### (2) 全域防御架构与六重物理安全网 (`workbuddy-log-guard`)
 为了实现极致克制与绝对自愈，项目设计了高内聚的守护进程组件：
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│              WorkBuddy Log Guardian (四重物理防御网)              │
+│              WorkBuddy Log Guardian (六重物理防御网)              │
 ├──────────────────────────────────────────────────────────────────┤
 │ 1. Open-FD 感知   : lsof 识别活跃句柄，对被持有着只 truncate 不 delete │
-│ 2. 36小时 TTL     : 自动物理淘汰超过 36h (-mmin +2160) 的历史日志   │
-│ 3. 2GB 容量硬顶   : 目录总量突破 2GB 时，按 stat 时间强制修剪至 1.5GB  │
-│ 4. 30MB 单文件熔断: 异常单文件超 30MB 自动 truncate -s 0 即刻释放 APFS│
+│ 2. 36小时 TTL     : 自动物理淘汰超过 36h (-mmin +2160) 的历史沙盒日志│
+│ 3. 2GB 容量硬顶   : 沙盒目录超 2GB 时，按 stat 时间强制修剪至 1.5GB  │
+│ 4. 30MB 单文件熔断: 沙盒日志超 30MB 自动 truncate -s 0 即刻释放 APFS│
+│ 5. 全域临时日志熔断: /tmp 巡检，单文件超 500MB 原位截断，防测试死循环  │
+│ 6. 更新缓存定向回收: 72h TTL 清理 BundleMigration 历史备份与下载包   │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 1. **Open-FD 句柄安全感知 (Zero Disruption)**：通过 `lsof -F n +D` 递归探测所有正在被 `sandbox-core` 读写的日志文件。**对被进程持有打开的文件只执行 `truncate -s 0`，坚决不 unlink 删除**，杜绝“文件被删但 APFS 物理块被进程死锁无法释放”的陷阱；
 2. **36 小时精细化 TTL 淘汰**：自动清除 36 小时（2160 分钟）前的所有历史沙盒日志，今日目录（`YYYYMMDD`）永久保护，绝不误触当前正在运行的会话；
 3. **2 GB 目录容量硬顶截断 (Hard Cap)**：即便 36 小时内因为高频并发跑测试导致日志激增，只要目录总量超过 2GB，立即按 `mtime` 从最旧的文件开始淘汰，强行将水位拉回 1.5GB，**物理层面彻底封死打满磁盘的可能性**；
-4. **单文件 30MB 物理熔断**：单文件异常暴走超过 30MB 时瞬间清零，零损耗释放磁盘块。
+4. **单文件 30MB 物理熔断**：单文件异常暴走超过 30MB 时瞬间清零，零损耗释放磁盘块；
+5. **全域临时日志应急熔断 (`clean_runaway_temp_logs`)**：自动扫描 `/tmp`、`/private/tmp` 及系统临时目录（`tempfile.gettempdir()`）。当检测到用户属主且匹配测试/崩溃模式的超大日志（如 `t-fail.log`、`*.log`、`*.err`）突破 500MB（可配置）时，采用原地 `truncate -s 0` 截断，**物理释放磁盘空间且不中断正在运行的测试进程**，Windows 下自动感知并跳过独占文件锁；
+6. **更新备份与缓存定向回收 (`clean_bundle_migration_cache`)**：定时清理 `~/Library/Caches/com.tencent.workbuddy.mac.BundleMigration/` 下超过 72 小时的陈旧 `.backup.app` 与 `.zip` 更新包，单次可无感挽救数 GB 空间。
 
 #### (3) 极简无感运行
 macOS 下由原生 LaunchAgent (`com.workbuddy.log-guard.plist`) 每 30 分钟静默触发一次，执行耗时 **< 20ms**，平时无事件时线程在内核中纯休眠，CPU 占用保持在绝对 **0.0%**。
@@ -702,6 +707,11 @@ macOS 下由原生 LaunchAgent (`com.workbuddy.log-guard.plist`) 每 30 分钟�
 - **问题**：运行 3~4 天后发现系统盘急剧减少 10GB 以上，排查发现 `~/.workbuddy/logs/sandbox/` 下存在数千个无淘汰机制的 PTY 输出日志。
 - **原因**：官方虽然设置了 13MB 单文件滚动，但未设计生命周期（TTL）管理与目录总容量限制。
 - **解决**：研发 `workbuddy-log-guard` 四重物理看门狗：`lsof` 句柄感知保护被持有着不被删除（仅截断）、36h TTL 淘汰过期历史、2GB 目录总量硬顶截断与 30MB 单文件物理熔断。
+
+#### 踩坑 7：自动化测试/异常子进程在 `/tmp` 倾倒 50GB 日志导致系统盘瞬间归零
+- **问题**：自动化测试死循环或构建探针异常，在 `/tmp` 下倾倒了 4.7 亿行、单文件超过 50GB 的失控日志（如 `t-fail.log`），加上客户端升级备份缓存 `BundleMigration` 积攒数 GB，导致系统磁盘彻底打满崩溃。
+- **原因**：看门狗此前仅巡检沙盒私有日志（`~/.workbuddy/logs/sandbox`），对操作系统临时目录（`/tmp`、`/private/tmp`、$TMPDIR）存在巡检盲区；若使用粗暴 `rm` 删除，由于活跃进程未释放打开的文件描述符（Open FD），操作系统在进程退出前不会退还物理磁盘块，且强行删除会导致写进程异常。
+- **解决**：为 `workbuddy-log-guard` 升级落地全域临时日志应急熔断器（`clean_runaway_temp_logs`）与升级缓存回收（`clean_bundle_migration_cache`）：单文件超 500MB（可配置）执行原位清零（`truncate -s 0`），既瞬间释放物理磁盘块又保护进程不崩溃，Windows 下自动感知并跳过独占文件锁。
 
 ---
 
@@ -1183,7 +1193,11 @@ wb-models
 
 ### 10. 沙盒日志看门狗配置与管理 (`workbuddy-log-guard`)
 
-有效治理 WorkBuddy 长期运行后 PTY 沙盒日志吞噬 10GB+ 磁盘积弊：
+有效治理 WorkBuddy 长期运行后 PTY 沙盒日志吞噬 10GB+ 磁盘积弊，并提供全域临时目录应急熔断与客户端升级垃圾定向回收：
+
+- **沙盒核心日志四重治理**：36h TTL 历史淘汰、2GB 目录总量硬顶截断、30MB 单文件物理熔断、`lsof` 活跃句柄感知；
+- **全域临时日志应急熔断 (`clean_runaway_temp_logs`)**：自动巡检 `/tmp`、`/private/tmp` 及系统临时目录（`tempfile.gettempdir()`），对用户属主且匹配测试/崩溃模式的超大日志（如 `t-fail.log`、`*.log`、`*.err`）突破 500MB 时执行原地截断 (`truncate -s 0`)，释放物理存储块且不破坏正在运行的测试进程；Windows 下自动捕获并跳过独占文件锁；
+- **升级缓存定向清理 (`clean_bundle_migration_cache`)**：定时清理 `~/Library/Caches/com.tencent.workbuddy.mac.BundleMigration/` 下超过 72 小时的陈旧 `.backup.app` 与 `.zip` 升级包。
 
 ```bash
 # 手动立即触发一次日志安全审计与物理修剪
@@ -1195,19 +1209,24 @@ workbuddy-log-guard
 
 ```json
 {
-  "ttl_minutes": 2160,       // 日志 TTL 过期淘汰时长 (默认 2160 分钟 = 36 小时)
-  "max_sandbox_mb": 2048,    // 沙盒日志目录容量硬顶 (默认 2048 MB = 2 GB)
-  "target_sandbox_mb": 1536, // 达到硬顶时自动修剪目标回落水位 (默认 1536 MB = 1.5 GB)
-  "max_file_mb": 30          // 单个日志文件物理熔断清零阈值 (默认 30 MB)
+  "ttl_minutes": 2160,               // 沙盒日志 TTL 过期淘汰时长 (默认 2160 分钟 = 36 小时)
+  "max_sandbox_mb": 2048,            // 沙盒日志目录容量硬顶 (默认 2048 MB = 2 GB)
+  "target_sandbox_mb": 1536,         // 达到硬顶时自动修剪目标回落水位 (默认 1536 MB = 1.5 GB)
+  "max_file_mb": 30,                 // 单个沙盒日志文件物理熔断清零阈值 (默认 30 MB)
+  "max_temp_file_mb": 500,           // 全域 /tmp 巨型临时日志原位截断熔断阈值 (默认 500 MB)
+  "bundle_migration_ttl_hours": 72   // 客户端 BundleMigration 升级包与备份淘汰 TTL (默认 72 小时)
 }
 ```
 
 #### 环境变量覆盖机制
 亦可通过系统环境变量覆盖以上参数（优先级高于配置文件）：
-- `WB_TTL_MINUTES`：覆盖 TTL 分钟数；
-- `WB_MAX_SANDBOX_MB`：覆盖目录总配额上限；
-- `WB_TARGET_SANDBOX_MB`：覆盖清理目标水位；
-- `WB_MAX_FILE_MB`：覆盖单文件熔断上限。
+- `WB_TTL_MINUTES`：覆盖沙盒日志 TTL 分钟数；
+- `WB_MAX_SANDBOX_MB`：覆盖沙盒日志目录总配额上限；
+- `WB_TARGET_SANDBOX_MB`：覆盖沙盒清理目标水位；
+- `WB_MAX_FILE_MB`：覆盖沙盒单文件熔断上限；
+- `WB_MAX_TEMP_FILE_MB`：覆盖系统临时目录日志单文件原位熔断上限（默认 500MB）；
+- `WB_BUNDLE_MIGRATION_TTL_HOURS`：覆盖升级包备份保留时长（默认 72 小时）；
+- `WB_TMP_DIR`：自定义指定临时监控目录（测试与自定义容器隔离环境）。
 
 ---
 
