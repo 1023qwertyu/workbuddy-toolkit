@@ -1,117 +1,117 @@
-# Engineering Notes
+# 工程笔记
 
-This project grew from concrete WorkBuddy failure modes rather than from a single feature list. The README intentionally keeps the product surface short; this document explains the engineering problems that shaped the toolkit.
+这个项目不是从一张“功能清单”长出来的，而是从一系列真实 WorkBuddy 故障逐步演化出来的。README 只保留产品入口，这份文档解释这些能力背后的工程问题。
 
-## 1. Account switching is a state-management problem
+## 1. 多账号切换本质上是状态管理问题
 
-The obvious implementation of multi-account switching is "save one credential file per account and copy the selected file back." That is not enough.
+最直觉的实现是：“每个账号保存一份凭据文件，需要时把目标文件复制回去。”这并不够。
 
-WorkBuddy may refresh credentials while it is running. If a switcher overwrites the active file with an older Profile, it can destroy a newer token and make the saved state regress.
+WorkBuddy 运行期间可能自动刷新凭据。如果切号工具把旧账号配置直接覆盖回活跃凭据，就可能破坏刚刷新出来的新 Token，让状态倒退。
 
-Toolkit therefore treats switching as a state transition:
+因此 Toolkit 把切换视为一个完整状态转换：
 
-1. inspect the current active account;
-2. synchronize the newest active credential state back to the matching Profile;
-3. prepare the target Profile;
-4. replace the active credential atomically;
-5. let WorkBuddy reload the new identity;
-6. keep diagnostics available if upstream behavior changes.
+1. 识别当前活跃账号；
+2. 把当前最新凭据同步回对应账号配置；
+3. 准备目标账号配置；
+4. 原子替换活跃凭据；
+5. 让 WorkBuddy 重新加载新身份；
+6. 如果上游行为变化，保留诊断入口。
 
-The important design point is not "fast switching." It is preserving the newest known state while switching.
+真正重要的不是“切得快”，而是**切换时保住最新状态**。
 
-## 2. Workspaces did not disappear; account filtering hid them
+## 2. 工作区没有丢，只是被账号过滤隐藏了
 
-A second failure appeared after account switching: historical sessions and workspaces looked as if they had been lost.
+切换账号后曾出现第二类故障：历史会话和工作区看起来像被删掉了。
 
-Investigation showed that the physical records were still present. The client filtered session visibility using the active user identity, and workspace visibility followed the visible sessions.
+调查发现，物理记录仍然存在。真正变化的是客户端按当前账号身份过滤了会话可见性，而工作区显示又依赖可见会话。
 
-Toolkit therefore uses WorkBuddy's existing shared-session semantics instead of copying project data or maintaining a second workspace database.
+因此 Toolkit 复用 WorkBuddy 已有的共享会话语义，而不是复制项目数据或再维护一套工作区数据库。
 
-This keeps the fix close to the real failure boundary:
+可以把问题理解成：
 
 ```text
-same local data
+同一份本地数据
       │
-account-scoped query
+按账号过滤查询
       │
-      ├── account A -> visible
-      └── account B -> hidden
+      ├── 账号 A -> 可见
+      └── 账号 B -> 被隐藏
 
-Toolkit normalizes the session ownership path used for local sharing.
+Toolkit 调整本地共享路径使用的会话归属语义。
 ```
 
-For the implementation, inspect `sql/` and the current `workbuddy init` behavior.
+具体实现可查看 `sql/` 和当前 `workbuddy init` 行为。
 
-## 3. WorkBuddy 5.6+ changed credential storage
+## 3. WorkBuddy 5.6+ 改变了凭据存储方式
 
-Older versions exposed important authentication fields as ordinary strings. Newer 5.6-series builds introduced encrypted credential envelopes for sensitive values.
+较早版本的重要认证字段通常表现为普通字符串。5.6 系列之后，敏感字段开始使用加密信封表示。
 
-That broke scripts which assumed that `accessToken`, `refreshToken` and related fields were always plaintext strings.
+这会直接击穿那些默认 `accessToken`、`refreshToken` 等字段永远是明文字符串的旧脚本。
 
-Toolkit's compatibility work follows a stricter rule:
+Toolkit 的兼容规则更严格：
 
-> Do not decrypt for storage.
+> 不为持久化而解密。
 
-When runtime access to a decrypted value is required, the compatibility layer should use the WorkBuddy runtime capability and keep persistent Profiles compatible with the upstream encrypted representation. The goal is interoperability, not building a plaintext credential archive.
+当运行时确实需要访问解密值时，应借助 WorkBuddy 自身运行时能力，同时让长期保存的账号配置继续兼容上游加密表示。目标是兼容，而不是建立明文凭据仓库。
 
-Because this boundary is version-sensitive, `workbuddy doctor` is more authoritative than static README claims.
+因为这个边界高度依赖版本和运行时，所以 `workbuddy doctor` 比 README 中的静态承诺更可靠。
 
-## 4. Sandbox failures became an operational problem
+## 4. 沙盒故障最终变成了生产问题
 
-The project later encountered failures that were not account-management problems at all: sandbox logs and session artifacts could grow aggressively, temporary output could consume large amounts of disk, and rule growth could turn into severe command latency or process termination.
+项目后期遇到的故障已经不只是账号管理问题：沙盒日志和会话产物可能快速增长，临时输出会吞掉大量磁盘，规则膨胀还可能导致明显命令延迟甚至进程被杀。
 
-Those incidents led to the log guard, bounded cleanup, sandbox healing and deeper `doctor` diagnostics.
+这些事故最后演化出了日志保护、有界清理、沙盒自愈和更深入的 `doctor` 诊断。
 
-The detailed evidence is preserved separately:
+详细证据单独保留：
 
-- [Incident 01 — Sandbox log and snapshot exhaustion](incidents/INCIDENT_01_SANDBOX_LOG_SNAPSHOT_EXHAUSTION.md)
-- [Incident 02 — Multi-agent Cargo build cache pressure](incidents/INCIDENT_02_CARGO_MULTI_AGENT_SCCACHE.md)
-- [Incident 04 — Seatbelt rule explosion and PTY freeze](incidents/INCIDENT_04_SEATBELT_RULE_EXPLOSION_AND_PTY_FREEZE.md)
-- [Incident index](incidents/README.md)
+- [事故 01：沙盒日志与快照耗尽](incidents/INCIDENT_01_SANDBOX_LOG_SNAPSHOT_EXHAUSTION.md)
+- [事故 02：多 Agent Cargo 构建缓存压力](incidents/INCIDENT_02_CARGO_MULTI_AGENT_SCCACHE.md)
+- [事故 04：Seatbelt 规则膨胀与 PTY 卡死](incidents/INCIDENT_04_SEATBELT_RULE_EXPLOSION_AND_PTY_FREEZE.md)
+- [事故复盘索引](incidents/README.md)
 
-The README no longer duplicates these reports. A landing page should show that the evidence exists, not reproduce the entire investigation.
+README 不再重复这些长报告。首页只需要说明“有证据、有复盘、有修复”，真正调查过程放在事故文档里。
 
-## 5. Why the router and model inventory exist
+## 5. 为什么会有容灾路由和模型清单
 
-Once account state and local runtime stability were under control, another failure mode became visible: an individual upstream model can be unavailable, rate-limited or temporarily unhealthy even when the WorkBuddy account itself is valid.
+当账号状态和本地运行时稳定性逐渐解决后，又暴露出另一类问题：账号本身是正常的，但某个具体上游模型可能暂时不可用、限流或异常。
 
-The optional router separates "account is healthy" from "this model request succeeded." Model inventory and usage tooling make that state observable instead of embedding model assumptions into every script.
+可选容灾路由把“账号健康”和“本次模型请求成功”拆开处理。模型清单与使用量工具则让这些状态可观察，而不是把模型假设硬编码到每个脚本中。
 
-This is an advanced capability. It is intentionally not part of the minimal installation path.
+这是高级能力，所以不会进入最小安装路径。
 
-## 6. Why `doctor` is central
+## 6. 为什么 `doctor` 是核心命令
 
-WorkBuddy Toolkit depends on an application it does not control. That means compatibility cannot be reduced to a version string.
+WorkBuddy Toolkit 依赖一个自己无法控制的上游应用，因此兼容性不能只靠版本号判断。
 
-`workbuddy doctor` exists to answer runtime questions such as:
+`workbuddy doctor` 用来回答这些运行时问题：
 
-- Where is the active credential store?
-- What credential representation is present?
-- Can the required runtime capability be resolved?
-- Is the sandbox sidecar healthy?
-- Has an expected upstream path or protocol drifted?
+- 当前活跃凭据存在哪里？
+- 当前凭据是什么表示形式？
+- 所需运行时能力是否可解析？
+- 沙盒旁路是否健康？
+- 上游路径或协议是否发生漂移？
 
-The project should prefer a visible diagnostic failure over a silent false-green state.
+项目应优先选择“明确报错”，而不是静默制造假绿状态。
 
-## 7. Engineering rules that follow from these incidents
+## 7. 从这些事故中形成的工程规则
 
-The recurring rules are simple:
+最终沉淀出的规则很简单：
 
-1. **Preserve upstream state before replacing it.**
-2. **Do not persist decrypted secrets just because a runtime path can decrypt them.**
-3. **Bound retries, file growth and IPC waits.**
-4. **Use locks around repair paths that may race.**
-5. **Prefer sidecar changes over patching the application bundle.**
-6. **Make upstream drift observable through diagnostics.**
-7. **Keep rollback possible.**
+1. **替换上游状态前，先保存最新状态。**
+2. **运行时能解密，不代表要持久化明文。**
+3. **重试、文件增长和 IPC 等待都必须有边界。**
+4. **可能并发竞争的修复路径必须加锁。**
+5. **优先做旁路集成，而不是修改应用包本体。**
+6. **上游变化必须能被诊断发现。**
+7. **始终保留回退路径。**
 
-These rules are more stable than any one implementation detail.
+这些规则比任何一个具体实现细节更稳定。
 
-## Further reading
+## 继续阅读
 
-- [Architecture](architecture.md)
-- [Getting Started](getting-started.md)
-- [Command Reference](command-reference.md)
-- [ADR directory](adr/)
-- [Specifications](specs/)
-- [Incident Reports](incidents/README.md)
+- [架构说明](architecture.md)
+- [入门指南](getting-started.md)
+- [命令参考](command-reference.md)
+- [架构决策记录（ADR）](adr/)
+- [详细规格](specs/)
+- [事故复盘](incidents/README.md)

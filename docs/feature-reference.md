@@ -1,176 +1,174 @@
-# Feature Reference
+# 功能参考
 
-This document is the capability index for WorkBuddy Toolkit. It keeps the README short without hiding advanced features.
+这份文档是 WorkBuddy Toolkit 的完整能力索引。README 保持简洁，这里负责说明：**有什么能力，以及什么时候该用。**
 
-The goal here is **what exists and when to use it**. Implementation details belong in [Architecture](architecture.md), [Engineering Notes](engineering-notes.md), ADRs, specs and incident reports.
+实现细节放在 [架构说明](architecture.md)、[工程笔记](engineering-notes.md)、架构决策记录（ADR）、详细规格和事故复盘中。
 
-## Account management
+## 账号管理
 
-### Terminal QR login — `wb-login`
+### 终端二维码登录 — `wb-login`
 
-Add a WorkBuddy account without using the normal repeated desktop logout/login flow. The login path can render the QR flow in the terminal and save the resulting account state as a local Profile.
+无需反复在桌面端退出、重新登录，就可以添加 WorkBuddy 账号。登录流程可以在终端显示二维码，并把登录后的账号状态保存为本地账号配置。
 
-Profile handling includes collision checks so a new login is less likely to overwrite an unrelated saved account by accident.
+账号保存时会做冲突检查，降低新登录状态误覆盖其他已保存账号的风险。
 
-### Account inventory — `wb-list` / `wb-status`
+### 账号清单 — `wb-list` / `wb-status`
 
-Inspect saved Profiles and the active account. Status tooling exposes account identity, credential representation and health information without printing raw access/refresh tokens in normal status output.
+查看已保存账号和当前活跃账号。状态工具会显示账号身份、凭据表示形式和健康状态，同时避免在普通输出中直接打印原始 access token / refresh token。
 
-Machine-readable output is available on supported status paths; verify the exact fields with the current command help before depending on them in automation.
+部分状态命令支持机器可读输出。若你要把它接入自动化，请先用当前版本的命令帮助确认字段。
 
-### Account switching — `wb-switch`
+### 账号切换 — `wb-switch`
 
-Switch between saved Profiles without repeating the full login flow.
+在已保存账号之间切换，不需要每次重新走完整登录流程。
 
-The switch path synchronizes the active account state before replacement so a newer token refreshed by WorkBuddy is not casually overwritten by an older Profile.
+切换前会先同步当前活跃账号的最新状态，避免 WorkBuddy 刚刷新出的新 Token 被旧账号配置覆盖。
 
-### Credential health audit — `wb-audit`
+### 凭据健康巡检 — `wb-audit`
 
-Inspect saved account health and handle near-expiry / expired states through the supported refresh path. Audit behavior is throttled so health checks do not become uncontrolled network polling.
+检查已保存账号的凭据健康状态，并通过受支持的刷新路径处理临期或过期情况。巡检有节流机制，避免健康检查变成高频网络轮询。
 
-Desktop notifications are supported on applicable platforms when a saved account needs attention.
+在支持的平台上，当账号需要处理时可以触发桌面通知。
 
-## Workspace and session continuity
+## 工作区与会话连续性
 
-### Shared local workspace/session state — `workbuddy init`
+### 本地工作区 / 会话共享 — `workbuddy init`
 
-Account switching can make historical sessions appear missing because WorkBuddy scopes session visibility by account identity.
+切换账号后，历史会话看起来可能“消失”。根因是 WorkBuddy 会按当前账号身份过滤会话可见性。
 
-Toolkit initializes a local sharing mechanism that uses WorkBuddy's existing session semantics so multiple local Profiles can continue to see the same physical workspace/session data.
+Toolkit 初始化本地共享机制，复用 WorkBuddy 已有的共享会话语义，让多个本地账号继续看到同一份物理工作区和会话数据。
 
-This feature does not duplicate project directories.
+这个功能不会复制项目目录。
 
-## Daily automation
+## 日常自动化
 
-### Check-in and continuity tasks — `wb-checkin`
+### 签到与连续任务 — `wb-checkin`
 
-Run supported daily account tasks across saved Profiles.
+对已保存账号执行支持的日常任务。
 
-The command can be used manually or scheduled through platform-native mechanisms installed by the toolkit.
+可以手动运行，也可以通过安装程序配置的平台原生调度器定时运行。
 
-### Platform scheduling
+### 平台原生调度
 
-Supported scheduler integrations include:
+支持：
 
-- macOS `launchd`
-- Linux `systemd --user`, with a cron fallback where applicable
-- Windows Task Scheduler
+- macOS：`launchd`
+- Linux：`systemd --user`，必要时降级到 `cron`
+- Windows：任务计划程序
 
-Background scheduling is optional. A user can keep the toolkit entirely manual.
+后台调度不是必需项。你也可以完全手动使用 Toolkit。
 
-## Usage and model tooling
+## 使用量与模型工具
 
-### Usage / credit metering — `wb-usage`
+### 使用量 / 积分计量 — `wb-usage`
 
-Inspect usage and credit-flow information over supported time windows. Detailed metering behavior is specified separately in [Credit Metering Spec](spec-credit-metering.md).
+查看指定时间窗内的使用量和积分流速。详细计量规则见 [积分计量规格](spec-credit-metering.md)。
 
-### Terminal chat — `wb-chat`
+### 终端模型调用 — `wb-chat`
 
-Call WorkBuddy model endpoints from the terminal without using the full desktop UI for every request.
+直接从终端调用 WorkBuddy 模型，不必每次打开完整桌面界面。
 
-This is optional and independent from basic multi-account management.
+这是可选能力，与基础多账号管理相互独立。
 
-### Model inventory — `wb-models`
+### 模型清单 — `wb-models`
 
-Inspect model inventory and metadata that Toolkit can observe for model selection and usage decisions.
+查看 Toolkit 能观察到的模型清单和相关元数据，辅助模型选择和成本判断。
 
-### Failover router — `wb-router`
+### 容灾路由 — `wb-router`
 
-Optional local routing layer for model-level resilience. It separates "the WorkBuddy account is valid" from "this specific upstream model request succeeded."
+可选的本地模型容灾层。它把“账号本身有效”和“这一次具体模型请求成功”区分开。
 
-Use the router when you need model fallback behavior; it is not required for ordinary account switching or check-in automation.
+只有需要模型故障切换时才需要启用。普通账号切换和自动签到不依赖它。
 
-## WorkBuddy 5.6+ credential compatibility
+## WorkBuddy 5.6+ 凭据兼容
 
-Newer WorkBuddy releases introduced encrypted envelopes for sensitive local credential fields. Toolkit includes a compatibility layer for environments where older plaintext assumptions no longer hold.
+较新的 WorkBuddy 版本开始把敏感本地凭据放进加密信封中。Toolkit 提供兼容层，不再依赖“Token 一定是明文字符串”的旧假设。
 
-The design rule is:
+设计规则是：
 
-> Runtime access to a decrypted value does not imply persistent plaintext storage.
+> 运行时需要访问解密值，不代表要把它长期保存为明文。
 
-Compatibility is runtime-sensitive. Use:
+兼容性取决于当前运行时，不能只看版本号。请运行：
 
 ```bash
 workbuddy doctor
 ```
 
-instead of assuming a version number is sufficient proof.
+## 诊断能力
 
-## Diagnostics
+### 兼容性诊断 — `wb-doctor`
 
-### Compatibility doctor — `wb-doctor`
+这是核心诊断命令，用于检查本地环境、凭据表示、WorkBuddy 运行时能力和部分旁路状态。
 
-The central diagnostic command checks the local environment, credential representation, WorkBuddy runtime capabilities and selected sidecar state.
+WorkBuddy 更新后，或行为突然变化时，优先先运行它。
 
-Use it after a WorkBuddy update or when behavior changes unexpectedly.
+### exit 137 / 命令卡死取证
 
-### Exit 137 / command-stall inspection
-
-A dedicated inspection path exists for process termination and resource/sandbox failure patterns:
+针对进程被杀、资源耗尽或沙盒异常，项目提供专门取证入口：
 
 ```bash
 wb-doctor --inspect-137
 ```
 
-Pair the output with [Incident Reports](incidents/README.md).
+建议把结果与 [事故复盘](incidents/README.md) 一起看。
 
-## Sandbox and runtime reliability
+## 沙盒与运行时稳定性
 
-### Log guard — `workbuddy-log-guard`
+### 日志保护 — `workbuddy-log-guard`
 
-Controls sandbox/log growth using bounded retention and size-based safeguards. The implementation is designed to avoid blindly deleting files that are still open by a running process.
+通过有界保留和容量限制控制沙盒 / 日志增长。实现会避免无脑删除仍被运行中进程持有的文件。
 
-### Sandbox healing — `wb-sandbox`
+### 沙盒自愈 — `wb-sandbox`
 
-Repairs supported sandbox/session-state failures and keeps repair work bounded. Concurrent repair paths use coordination so multiple processes do not independently rewrite the same state at once.
+处理已支持的沙盒 / 会话状态故障，并限制修复过程的范围。并发修复路径会做协调，避免多个进程同时改写同一状态。
 
-### Temporary-file and update-cache cleanup
+### 临时文件与更新缓存清理
 
-Maintenance paths cover known runaway temporary logs and stale WorkBuddy update/migration artifacts. These paths are deliberately targeted rather than acting as a generic system cleaner.
+维护路径覆盖已知的异常临时日志，以及过期的 WorkBuddy 更新 / 迁移产物。它是定向治理，不是通用系统清理器。
 
-### IPC safety boundaries
+### IPC 安全边界
 
-Toolkit's local IPC integrations use bounded waits and payload limits so an unhealthy sidecar/runtime path does not turn into an unbounded terminal hang.
+Toolkit 的本地 IPC 集成采用有界等待和负载限制，避免异常旁路或运行时问题演变成无限终端卡死。
 
-## Remote health monitoring
+## 远端健康监控
 
-The repository includes GitHub Actions-based monitoring support for compatible remote runners. It can run health checks on supported platforms and use GitHub's workflow failure notification path as an alert mechanism.
+仓库提供基于 GitHub Actions 的远端健康监控能力，可在受支持的远端 Runner 上执行健康检查，并利用 GitHub 工作流失败通知作为告警路径。
 
-This is an advanced deployment pattern. Local users do not need GitHub Actions to use the toolkit.
+这是高级部署方式。本地用户不需要 GitHub Actions 也可以正常使用 Toolkit。
 
-## Security and rollback
+## 安全与回退
 
-### Local Profile storage
+### 本地账号配置
 
-Saved account Profiles remain local to the machine unless the user explicitly moves them elsewhere.
+已保存账号配置默认保留在当前机器上，除非用户主动把它们移动到其他位置。
 
-### Sensitive output boundaries
+### 敏感输出边界
 
-Status / JSON-oriented tooling is designed to omit raw access and refresh tokens from ordinary output.
+状态 / JSON 输出路径应避免在普通输出中暴露原始 access token 和 refresh token。
 
-### Process and file boundaries
+### 进程与文件边界
 
-Runtime helpers use restricted file/process behavior where applicable to reduce accidental credential exposure through inherited handles, permissive files or crash artifacts.
+运行时辅助程序在适用场景下使用更严格的文件 / 进程边界，降低凭据通过继承句柄、宽松权限或崩溃产物意外泄露的风险。
 
-### Uninstall / rollback
+### 卸载 / 回退
 
-Toolkit installation is designed to be reversible. Use the platform uninstall path when you want to remove CLI links, background services and Toolkit-owned integration state.
+Toolkit 的安装设计为可回退。需要退出时，使用对应平台的卸载路径移除命令链接、后台服务和 Toolkit 自己维护的集成状态。
 
-## Upstream compatibility model
+## 上游兼容模型
 
-There are three practical cases:
+实际可以分成三种情况：
 
-1. **WorkBuddy fixes an upstream problem itself.** Toolkit should coexist or become unnecessary for that path without requiring application-bundle patches.
-2. **WorkBuddy changes unrelated features.** Existing sidecar behavior should continue if the required local contracts remain intact.
-3. **WorkBuddy changes a required path, format or protocol.** Toolkit should surface the drift through diagnostics rather than silently claiming compatibility.
+1. **WorkBuddy 官方修复了原问题。** Toolkit 应该能够共存，或者该路径变得不再需要，同时不依赖修改应用包。
+2. **WorkBuddy 更新了无关功能。** 只要依赖的本地契约没有变化，现有旁路行为应该继续工作。
+3. **WorkBuddy 修改了关键路径、格式或协议。** Toolkit 应通过诊断明确暴露变化，而不是静默宣称兼容。
 
-This is why `workbuddy doctor` is part of the normal workflow instead of only a troubleshooting command.
+因此 `workbuddy doctor` 是日常工作流的一部分，不只是出故障时才用的命令。
 
-## Evidence and deep dives
+## 证据与深入阅读
 
-- [Architecture](architecture.md)
-- [Engineering Notes](engineering-notes.md)
-- [Incident Reports](incidents/README.md)
-- [ADR directory](adr/)
-- [Specifications](specs/)
-- [Credit Metering Spec](spec-credit-metering.md)
+- [架构说明](architecture.md)
+- [工程笔记](engineering-notes.md)
+- [事故复盘](incidents/README.md)
+- [架构决策记录（ADR）](adr/)
+- [详细规格](specs/)
+- [积分计量规格](spec-credit-metering.md)

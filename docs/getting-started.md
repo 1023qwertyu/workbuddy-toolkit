@@ -1,4 +1,4 @@
-# Getting Started
+# 入门指南
 
 这份文档只解决一件事：把 WorkBuddy Toolkit 安装好，并完成第一次可验证的使用。
 
@@ -59,7 +59,7 @@ workbuddy status
 
 1. 初始化 Toolkit 需要的本地结构与工作区共享机制。
 2. 检查当前 WorkBuddy 版本、凭据格式和本地运行时兼容性。
-3. 查看当前账号与已保存 Profile 的状态。
+3. 查看当前账号与已保存账号配置的状态。
 
 如果 `doctor` 报告不兼容，不要继续强行切换账号。先按诊断结果处理。
 
@@ -83,7 +83,7 @@ wb-list
 wb-switch
 ```
 
-Toolkit 会在切换前同步当前登录态，降低旧 Profile 覆盖新 Token 的风险。
+Toolkit 会在切换前同步当前登录态，降低旧账号配置覆盖新 Token 的风险。
 
 ## 5. 自动签到与账号巡检
 
@@ -107,7 +107,7 @@ wb-audit
 
 如果你不希望后台自动运行，可以关闭系统调度，保留手动命令。
 
-## 6. 让 AI Coding Agent 帮你安装
+## 6. 让 AI 编程 Agent 帮你安装
 
 如果你使用 Codex、Claude Code、Cursor、Hermes、OpenCode 或其他能执行终端命令的 Agent，可以把下面的任务交给它：
 
@@ -123,7 +123,7 @@ wb-audit
 7. 最后汇报：安装位置、doctor 结果、当前账号状态、后台调度是否启用。
 ```
 
-这个版本刻意比旧 README 中的长 Prompt 更短。Agent 应以仓库当前实现和 `workbuddy doctor` 的实际输出为准，而不是依赖一段长期可能过期的安装说明。
+这个版本刻意比旧 README 中的长提示词更短。Agent 应以仓库当前实现和 `workbuddy doctor` 的实际输出为准，而不是依赖一段长期可能过期的安装说明。
 
 ## 7. 常用命令
 
@@ -142,7 +142,7 @@ wb-models     查看模型与倍率信息
 wb-doctor     兼容性与故障诊断
 ```
 
-完整说明见 [Command Reference](command-reference.md)。
+完整说明见 [命令参考](command-reference.md)。
 
 ## 8. 安全回退
 
@@ -156,8 +156,8 @@ python3 uninstall.py
 
 ## 下一步
 
-- [Feature Reference](feature-reference.md) — 完整能力索引
-- [Command Reference](command-reference.md) — 命令和使用场景
-- [Architecture](architecture.md) — 系统边界与设计原则
-- [Engineering Notes](engineering-notes.md) — 为什么项目会做成现在这样
-- [Incident Reports](incidents/README.md) — 真实故障、证据与修复
+- [功能参考](feature-reference.md) — 完整能力索引
+- [命令参考](command-reference.md) — 命令和使用场景
+- [架构说明](architecture.md) — 系统边界与设计原则
+- [工程笔记](engineering-notes.md) — 为什么项目会做成现在这样
+- [事故复盘](incidents/README.md) — 真实故障、证据与修复

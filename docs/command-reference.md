@@ -1,28 +1,28 @@
-# Command Reference
+# 命令参考
 
-This page is a practical map of the main CLI surface. For exact flags supported by the current checkout, use `workbuddy help` / `wb-help` and the command's own help output.
+这份文档是 WorkBuddy Toolkit 主要命令行能力的实用索引。当前版本支持的精确参数，请以 `workbuddy help` / `wb-help` 和各命令自己的帮助输出为准。
 
-## Command map
+## 命令总览
 
-| Command | Purpose | Typical use |
+| 命令 | 用途 | 常见场景 |
 |---|---|---|
-| `workbuddy init` | Initialize Toolkit integration | First install or repair |
-| `wb-login` | Add or refresh an account Profile | Add another WorkBuddy account |
-| `wb-list` | List saved Profiles | See available accounts |
-| `wb-status` | Inspect current account state | Verify active identity and health |
-| `wb-switch` | Switch to another saved Profile | Change accounts without repeating the full login flow |
-| `wb-audit` | Audit credential health | Detect expiry or refresh problems |
-| `wb-checkin` | Run daily check-in / keep-alive flow | Manual or scheduled daily task |
-| `wb-usage` | Inspect usage / credit flow | Understand consumption over time |
-| `wb-chat` | Call WorkBuddy models from the terminal | Lightweight CLI interaction |
-| `wb-router` | Manage the optional failover router | Resilient model access |
-| `wb-models` | Inspect model inventory and multipliers | Model selection / cost visibility |
-| `wb-doctor` | Diagnose local compatibility | First command after an upstream change |
-| `wb-help` | Show installed command help | Discover current CLI surface |
+| `workbuddy init` | 初始化 Toolkit 集成 | 第一次安装或修复 |
+| `wb-login` | 添加或刷新账号配置 | 添加新的 WorkBuddy 账号 |
+| `wb-list` | 列出已保存账号 | 查看有哪些账号可用 |
+| `wb-status` | 查看当前账号状态 | 确认当前身份和健康状态 |
+| `wb-switch` | 切换到另一个已保存账号 | 不重新登录直接换号 |
+| `wb-audit` | 巡检凭据健康度 | 检查过期或刷新问题 |
+| `wb-checkin` | 执行每日签到 / 连续任务 | 手动或定时日常任务 |
+| `wb-usage` | 查看使用量 / 积分流速 | 分析一段时间的消耗 |
+| `wb-chat` | 从终端调用 WorkBuddy 模型 | 轻量命令行交互 |
+| `wb-router` | 管理可选容灾路由 | 模型请求容灾 |
+| `wb-models` | 查看模型清单与倍率 | 模型选择 / 成本判断 |
+| `wb-doctor` | 诊断本地兼容性 | 上游更新后的首个检查命令 |
+| `wb-help` | 查看已安装命令帮助 | 发现当前命令能力 |
 
-Most `wb-*` commands are convenience aliases around the main `workbuddy` CLI installed by the toolkit.
+多数 `wb-*` 命令是 Toolkit 安装后对主 `workbuddy` 命令行的便捷别名。
 
-## Recommended first-run sequence
+## 推荐的首次运行顺序
 
 ```bash
 workbuddy init
@@ -31,146 +31,146 @@ workbuddy status
 wb-list
 ```
 
-Do not start by switching accounts repeatedly if `doctor` already reports an incompatible or partially resolved runtime.
+如果 `doctor` 已经报告运行时不兼容或只解析了一部分能力，不要一上来反复切换账号。
 
-## Account lifecycle
+## 账号生命周期
 
-### Add an account
+### 添加账号
 
 ```bash
 wb-login
 ```
 
-Use this when you want to add a new account or refresh an existing Profile through the Toolkit login flow.
+用于添加新账号，或通过 Toolkit 登录流程刷新已有账号配置。
 
-### Inspect saved accounts
+### 查看已保存账号
 
 ```bash
 wb-list
 ```
 
-Use `wb-status` when you care about the currently active account and its runtime state:
+如果你更关心当前活跃账号和运行时状态，用：
 
 ```bash
 wb-status
 ```
 
-### Switch accounts
+### 切换账号
 
 ```bash
 wb-switch
 ```
 
-Switching is stateful. Toolkit synchronizes the current active credential state before replacing the active Profile so a newer token is less likely to be overwritten by stale saved state.
+切换不是简单文件覆盖。Toolkit 会先同步当前活跃凭据，再替换目标账号配置，降低较新的 Token 被旧状态覆盖的风险。
 
-## Health and diagnostics
+## 健康检查与诊断
 
-### Credential audit
+### 凭据巡检
 
 ```bash
 wb-audit
 ```
 
-Use this for account health checks, especially for Profiles that have not been activated recently.
+用于检查账号健康状态，尤其适合长期没有切换过的副号。
 
-### Compatibility doctor
+### 兼容性诊断
 
 ```bash
 wb-doctor
 ```
 
-Use `doctor` after:
+这些情况建议先运行 `doctor`：
 
-- upgrading WorkBuddy;
-- changing machines;
-- seeing unexpected logout behavior;
-- seeing sandbox or IPC-related failures;
-- reinstalling Toolkit.
+- 升级 WorkBuddy 后；
+- 换机器后；
+- 突然出现异常退出登录；
+- 出现沙盒或 IPC 相关故障；
+- 重装 Toolkit 后。
 
-The README intentionally does not hard-code every possible diagnostic state. The runtime output is more useful than a static compatibility promise.
+README 不再硬编码所有可能的诊断状态。真实运行时输出比静态兼容承诺更有价值。
 
-### Exit 137 / command-stall investigation
+### exit 137 / 命令卡死排查
 
-The current toolkit includes a dedicated inspection path documented in the existing project material:
+当前 Toolkit 提供专门取证入口：
 
 ```bash
 wb-doctor --inspect-137
 ```
 
-Use it when commands are being killed or when the failure pattern points to sandbox/resource exhaustion. Pair the output with the incident reports under [`docs/incidents/`](incidents/README.md).
+当命令被杀，或故障特征指向沙盒 / 资源耗尽时使用。建议配合 [`docs/incidents/`](incidents/README.md) 下的事故复盘一起判断。
 
-## Automation
+## 自动化
 
-### Daily check-in
+### 每日签到
 
 ```bash
 wb-checkin
 ```
 
-Run it manually first. Only after the command succeeds should you rely on a background schedule.
+建议第一次先手动运行。确认命令本身成功后，再依赖后台定时任务。
 
-Toolkit installers can integrate with platform-native schedulers. The exact scheduler is platform-dependent; see [Getting Started](getting-started.md).
+Toolkit 安装器可以接入平台原生调度。具体方式取决于操作系统，见 [入门指南](getting-started.md)。
 
-## Usage visibility
+## 使用量查看
 
 ```bash
 wb-usage
 ```
 
-Use this to inspect usage / credit-flow information exposed by the toolkit. If you are feeding the output into another program, prefer machine-readable output when the current command supports it.
+用于查看 Toolkit 能提供的使用量 / 积分流速信息。如果要把输出交给其他程序处理，优先使用当前版本支持的机器可读输出。
 
-## Terminal model access
+## 终端模型调用
 
 ```bash
 wb-chat
 ```
 
-This is optional. Account management does not require you to use the CLI chat path.
+这是可选能力。基础账号管理不要求使用终端模型调用。
 
-## Router
+## 容灾路由
 
 ```bash
 wb-router
 ```
 
-The router is an advanced capability for handling model-level failure separately from account health. Do not treat it as a required step in the basic install.
+容灾路由是高级能力，用于把模型层故障与账号健康状态分开处理。基础安装并不要求启用。
 
-## Model inventory
+## 模型清单
 
 ```bash
 wb-models
 ```
 
-Use it to inspect the model inventory and the metadata Toolkit can observe for model selection and usage decisions.
+用于查看 Toolkit 能观察到的模型清单和相关元数据，辅助模型选择和使用量判断。
 
-## Machine-readable state
+## 机器可读状态
 
-Some status and diagnostic paths support JSON output. The current README historically documents `--json` for status/diagnostic workflows. Verify the exact command help in your installed version before building automation around a field name.
+部分状态和诊断命令支持 JSON 输出。旧 README 曾记录 `--json` 用于状态 / 诊断场景。真正接入自动化前，请先检查当前安装版本的命令帮助，确认参数和字段名。
 
-Example pattern:
+示例：
 
 ```bash
 wb-status --json
 ```
 
-Automation should consume documented fields and tolerate future additive fields.
+自动化应依赖已文档化字段，并允许未来增加新字段。
 
-## Safe operating rule
+## 安全操作顺序
 
-When WorkBuddy changes upstream, use this order:
+WorkBuddy 上游发生变化时，建议按这个顺序：
 
 ```text
 1. wb-doctor
 2. wb-status
 3. wb-list
-4. only then run write/switch/automation actions
+4. 确认无异常后，再执行写入 / 切换 / 自动化操作
 ```
 
-That keeps compatibility detection ahead of state mutation.
+这样可以把兼容性检查放在状态修改之前。
 
-## Related docs
+## 相关文档
 
-- [Getting Started](getting-started.md)
-- [Architecture](architecture.md)
-- [Engineering Notes](engineering-notes.md)
-- [Incident Reports](incidents/README.md)
+- [入门指南](getting-started.md)
+- [架构说明](architecture.md)
+- [工程笔记](engineering-notes.md)
+- [事故复盘](incidents/README.md)

@@ -9,41 +9,41 @@
 
 **让 WorkBuddy 多账号真正适合长期使用。**
 
-WorkBuddy Toolkit 是一个本地 sidecar 工具箱，用来解决多账号切换、凭据生命周期、自动签到、跨账号工作区、模型容灾和运行时稳定性问题。
+WorkBuddy Toolkit 是一套本地旁路工具（sidecar），用于解决多账号切换、凭据生命周期、自动签到、跨账号工作区、模型容灾和运行时稳定性问题。
 
 ```text
-登录多个账号  →  保存 Profile  →  秒级切换
+登录多个账号  →  保存账号配置  →  秒级切换
                     │
                     ├── 自动签到 / 健康巡检
                     ├── 工作区与历史会话共享
                     ├── WorkBuddy 5.6+ 凭据兼容
-                    ├── CLI / Model Inventory / Router
-                    └── Sandbox / Log Guard / Doctor
+                    ├── 命令行 / 模型清单 / 容灾路由
+                    └── 沙盒治理 / 日志保护 / 环境诊断
 ```
 
-**不想研究内部实现？** 直接从 [Quick Start](#quick-start) 开始。  
-**想知道它为什么这么设计？** 看 [Architecture](docs/architecture.md)、[Engineering Notes](docs/engineering-notes.md) 和 [Incident Reports](docs/incidents/README.md)。
+**只想把工具用起来？** 直接看 [快速开始](#快速开始)。  
+**想知道它为什么这么设计？** 看 [架构说明](docs/architecture.md)、[工程笔记](docs/engineering-notes.md) 和 [事故复盘](docs/incidents/README.md)。
 
 ---
 
-## Why WorkBuddy Toolkit?
+## 为什么需要 WorkBuddy Toolkit？
 
 多账号本身不难。难的是多账号长期运行后出现的状态问题。
 
 | 原生使用中的问题 | Toolkit 的处理方式 |
 |---|---|
-| 添加 / 切换账号需要反复走登录流程 | 保存本地 Profile，提供 `wb-login` / `wb-switch` |
+| 添加或切换账号时要反复走登录流程 | 保存本地账号配置，使用 `wb-login` / `wb-switch` |
 | 切账号后历史会话、工作区像“消失”了一样 | 复用 WorkBuddy 的共享会话语义，保持本地工作区连续 |
-| 活跃账号 Token 被刷新后，旧 Profile 可能覆盖新状态 | 切换前同步当前凭据，再执行替换 |
+| WorkBuddy 自动刷新 Token 后，旧账号配置可能覆盖新状态 | 切换前先同步当前凭据，再执行替换 |
 | 副号长期不用，失效时才发现 | `wb-audit` + `wb-status` 做健康巡检 |
 | 每日签到、连续任务需要重复操作 | `wb-checkin` + 平台原生调度 |
 | WorkBuddy 更新后内部格式或运行时行为变化 | `wb-doctor` 显式检查兼容性和上游漂移 |
 
-Toolkit 还提供模型资产查看、终端调用、可选容灾 Router、Sandbox 自愈和日志生命周期治理。这些是高级能力，不是第一次安装必须理解的内容。完整能力索引见 [Feature Reference](docs/feature-reference.md)。
+Toolkit 还提供模型资产查看、终端调用、可选容灾路由、沙盒自愈和日志生命周期治理。这些是高级能力，不是第一次安装必须理解的内容。完整能力索引见 [功能参考](docs/feature-reference.md)。
 
 ---
 
-## Quick Start
+## 快速开始
 
 ### 1. 安装
 
@@ -78,7 +78,7 @@ workbuddy doctor
 workbuddy status
 ```
 
-`doctor` 是关键步骤。WorkBuddy 是 Toolkit 的上游依赖，版本号本身不能保证运行时一定兼容。
+`doctor` 是关键步骤。WorkBuddy 是 Toolkit 的上游依赖，单看版本号不能证明当前运行时一定兼容。
 
 ### 3. 添加并切换账号
 
@@ -95,12 +95,12 @@ wb-checkin
 wb-audit
 ```
 
-完整安装说明见 [Getting Started](docs/getting-started.md)。
+完整安装说明见 [入门指南](docs/getting-started.md)。
 
 <details>
-<summary><strong>让 Codex / Claude Code / Cursor / Hermes 等 Agent 帮你安装</strong></summary>
+<summary><strong>让 Codex / Claude Code / Cursor / Hermes 等 AI 编程 Agent 帮你安装</strong></summary>
 
-把下面这段发给能执行终端命令的 Coding Agent：
+把下面这段发给能执行终端命令的 Agent：
 
 ```text
 请帮我安装并验证 WorkBuddy Toolkit：
@@ -114,18 +114,18 @@ wb-audit
 7. 最后汇报安装位置、doctor 结果、当前账号状态和后台调度状态。
 ```
 
-更完整的 Agent 安装说明见 [Getting Started](docs/getting-started.md#6-让-ai-coding-agent-帮你安装)。
+更完整的说明见 [入门指南中的 AI Agent 安装部分](docs/getting-started.md#6-让-ai-coding-agent-帮你安装)。
 
 </details>
 
 ---
 
-## What it does
+## 核心能力
 
-### Account Management
+### 账号管理
 
 ```text
-wb-login      添加 / 刷新账号 Profile
+wb-login      添加 / 刷新账号配置
 wb-list       查看已保存账号
 wb-status     查看当前账号与凭据状态
 wb-switch     切换账号
@@ -134,7 +134,7 @@ wb-audit      检查账号健康度
 
 核心目标不是“能切号”，而是**切号时尽量不破坏 WorkBuddy 已经刷新的最新状态**。
 
-### Automation
+### 自动化
 
 ```text
 wb-checkin    每日签到与连续任务
@@ -149,51 +149,51 @@ wb-usage      积分消耗与流速统计
 
 如果你不需要后台任务，可以只保留手动命令。
 
-### Developer Tools
+### 开发者工具
 
 ```text
 wb-chat       终端直接调用 WorkBuddy 模型
-wb-models     模型资产与倍率信息
-wb-router     可选模型容灾 Router
+wb-models     查看模型资产与倍率信息
+wb-router     可选模型容灾路由
 wb-doctor     环境、凭据与运行时诊断
 wb-help       当前版本命令帮助
 ```
 
-### Runtime Reliability
+### 运行时稳定性
 
-Toolkit 还包含一组从真实故障中长出来的运行时保护：
+Toolkit 还包含一组从真实故障中长出来的保护机制：
 
 - WorkBuddy 5.6+ 加密凭据兼容；
-- 跨账号 workspace / session 连续性；
-- Sandbox 规则与会话状态修复；
-- runaway log / temp file 生命周期限制；
+- 跨账号工作区 / 会话连续性；
+- 沙盒规则与会话状态修复；
+- 异常日志 / 临时文件生命周期限制；
 - IPC 超时与异常边界；
 - 并发修复路径的互斥保护；
-- 可回滚的 sidecar 安装模型。
+- 可回滚的旁路安装模型。
 
-这些能力的完整解释不再塞在 README 中。先看 [Feature Reference](docs/feature-reference.md)，需要理解实现边界时再看 [Architecture](docs/architecture.md) 和 [Engineering Notes](docs/engineering-notes.md)。
+这些能力的完整解释不再塞在 README 中。先看 [功能参考](docs/feature-reference.md)，需要理解实现边界时再看 [架构说明](docs/architecture.md) 和 [工程笔记](docs/engineering-notes.md)。
 
 ---
 
-## Choose your path
+## 按你的目的阅读
 
 ### 我只想把工具用起来
 
 按这个顺序看：
 
-1. [Getting Started](docs/getting-started.md)
-2. [Command Reference](docs/command-reference.md)
+1. [入门指南](docs/getting-started.md)
+2. [命令参考](docs/command-reference.md)
 3. 出现异常时先运行 `wb-doctor`
 
 ### 我想理解它怎么工作
 
 按这个顺序看：
 
-1. [Feature Reference](docs/feature-reference.md)
-2. [Architecture](docs/architecture.md)
-3. [Engineering Notes](docs/engineering-notes.md)
-4. [Incident Reports](docs/incidents/README.md)
-5. [ADR](docs/adr/) / [Specs](docs/specs/)
+1. [功能参考](docs/feature-reference.md)
+2. [架构说明](docs/architecture.md)
+3. [工程笔记](docs/engineering-notes.md)
+4. [事故复盘](docs/incidents/README.md)
+5. [架构决策记录（ADR）](docs/adr/) / [详细规格](docs/specs/)
 
 ### 我是 AI Agent
 
@@ -201,17 +201,17 @@ Toolkit 还包含一组从真实故障中长出来的运行时保护：
 
 ---
 
-## How it works
+## 工作原理
 
 ```text
-                     WorkBuddy Desktop
+                     WorkBuddy 桌面端
                            │
           ┌────────────────┼────────────────┐
           │                │                │
-     Credentials         SQLite          Runtime
+        凭据             SQLite          运行时
           │                │                │
           ▼                ▼                ▼
-     Profile Store   Session Sharing   Sandbox / Logs
+      账号配置库        会话共享         沙盒 / 日志
           │                │                │
           └────────────────┼────────────────┘
                            ▼
@@ -219,70 +219,70 @@ Toolkit 还包含一组从真实故障中长出来的运行时保护：
                            │
           ┌────────────────┼────────────────┐
           │                │                │
-      Account CLI       Automation      Diagnostics
-      login/list        check-in        doctor/audit
-      switch/status     scheduling      incident tools
+       账号命令行         自动化            诊断
+       登录/列表          签到             doctor/audit
+       切换/状态          定时任务          事故取证
                            │
                            ▼
-                    Optional Router
+                       可选容灾路由
 ```
 
-### Four design rules
+### 四条设计原则
 
-**1. Sidecar, not app patching**  
+**1. 旁路集成，不修改应用本体**  
 尽量在 WorkBuddy 外部完成集成，不把修改永久写进应用包。
 
-**2. Preserve state before switching**  
-切换账号前先同步当前活跃状态，避免旧 Profile 反向覆盖新 Token。
+**2. 切换前先保存最新状态**  
+切换账号前先同步当前活跃状态，避免旧账号配置反向覆盖新 Token。
 
-**3. Do not decrypt for storage**  
+**3. 解密用于运行，不用于明文存储**  
 需要运行时访问加密凭据时，不因此把敏感字段长期保存成明文副本。
 
-**4. Detect upstream drift**  
+**4. 主动检测上游变化**  
 WorkBuddy 更新后如果路径、格式或协议发生变化，优先让 `doctor` 报出来，而不是制造“看起来正常”的假绿状态。
 
-更详细的边界和组件关系见 [Architecture](docs/architecture.md)。
+更详细的组件关系见 [架构说明](docs/architecture.md)。
 
 ---
 
-## Engineering Notes
+## 工程笔记
 
 README 只保留三个最能说明这个项目为何存在的案例。
 
-### 1. WorkBuddy 5.6+ encrypted credentials
+### 1. WorkBuddy 5.6+ 加密凭据兼容
 
 WorkBuddy 5.6 系列改变了本地敏感凭据的表示方式。旧脚本如果默认 `accessToken` / `refreshToken` 永远是普通字符串，会直接失效。
 
 Toolkit 增加运行时兼容层，同时坚持一个边界：**需要解密能力，不等于把解密结果持久化。**
 
-[Read the engineering note →](docs/engineering-notes.md#3-workbuddy-56-changed-credential-storage)
+[查看工程笔记 →](docs/engineering-notes.md#3-workbuddy-56-改变了凭据存储方式)
 
 ### 2. “切号后工作区丢了”并不等于数据丢了
 
-调查发现，本地记录仍在；变化的是账号身份参与了 session 可见性过滤。Toolkit 因此处理会话归属和共享语义，而不是复制一套项目目录。
+调查发现，本地记录仍在；变化的是账号身份参与了会话可见性过滤。Toolkit 因此处理会话归属和共享语义，而不是复制一套项目目录。
 
-[Read the engineering note →](docs/engineering-notes.md#2-workspaces-did-not-disappear-account-filtering-hid-them)
+[查看工程笔记 →](docs/engineering-notes.md#2-工作区没有丢只是被账号过滤隐藏了)
 
-### 3. Sandbox / log failures became production problems
+### 3. 沙盒和日志问题最终变成了生产事故
 
-项目后期遇到过 runaway logs、session artifacts、规则增长和命令卡顿等真实故障。这些事故最终形成了 Log Guard、Sandbox Heal 和更深的 `doctor` 取证路径。
+项目后期遇到过异常日志增长、会话产物堆积、规则膨胀和命令卡顿等真实故障。这些事故最终形成了日志保护、沙盒自愈和更深的 `doctor` 取证路径。
 
 证据和复盘单独保存：
 
-- [Sandbox log & snapshot exhaustion](docs/incidents/INCIDENT_01_SANDBOX_LOG_SNAPSHOT_EXHAUSTION.md)
-- [Multi-agent Cargo build pressure](docs/incidents/INCIDENT_02_CARGO_MULTI_AGENT_SCCACHE.md)
-- [Seatbelt rule explosion & PTY freeze](docs/incidents/INCIDENT_04_SEATBELT_RULE_EXPLOSION_AND_PTY_FREEZE.md)
+- [事故 01：沙盒日志与快照耗尽](docs/incidents/INCIDENT_01_SANDBOX_LOG_SNAPSHOT_EXHAUSTION.md)
+- [事故 02：多 Agent Cargo 构建缓存压力](docs/incidents/INCIDENT_02_CARGO_MULTI_AGENT_SCCACHE.md)
+- [事故 04：Seatbelt 规则膨胀与 PTY 卡死](docs/incidents/INCIDENT_04_SEATBELT_RULE_EXPLOSION_AND_PTY_FREEZE.md)
 
-[Browse all incident reports →](docs/incidents/README.md)
+[查看全部事故复盘 →](docs/incidents/README.md)
 
 ---
 
-## Commands at a glance
+## 常用命令速查
 
-| Command | Purpose |
+| 命令 | 用途 |
 |---|---|
 | `wb-login` | 添加或刷新账号 |
-| `wb-list` | 查看账号 Profile |
+| `wb-list` | 查看账号配置 |
 | `wb-status` | 查看当前状态 |
 | `wb-switch` | 切换账号 |
 | `wb-audit` | 凭据健康巡检 |
@@ -290,27 +290,27 @@ Toolkit 增加运行时兼容层，同时坚持一个边界：**需要解密能�
 | `wb-usage` | 使用量与积分流速 |
 | `wb-chat` | 终端模型调用 |
 | `wb-models` | 模型资产与倍率 |
-| `wb-router` | 模型容灾 Router |
+| `wb-router` | 模型容灾路由 |
 | `wb-doctor` | 兼容性和故障诊断 |
 | `wb-help` | 查看当前版本帮助 |
 
-完整说明见 [Command Reference](docs/command-reference.md)。
+完整说明见 [命令参考](docs/command-reference.md)。
 
 ---
 
-## Platform support
+## 平台支持
 
-| Platform | Integration | Credential location |
+| 平台 | 系统集成 | 凭据位置 |
 |---|---|---|
-| macOS | `launchd` | WorkBuddy macOS application data |
-| Linux | `systemd --user` / `cron` fallback | XDG-style application data |
-| Windows 10/11 | Task Scheduler | `%APPDATA%` application data |
+| macOS | `launchd` | WorkBuddy macOS 应用数据目录 |
+| Linux | `systemd --user` / `cron` 降级方案 | XDG 风格应用数据目录 |
+| Windows 10/11 | 任务计划程序 | `%APPDATA%` 应用数据目录 |
 
-Requirements:
+要求：
 
 - Python 3.8+
 - WorkBuddy 已安装并至少登录过一次
-- Toolkit 本身以 Python 标准库实现为主，不要求额外 pip 依赖作为基础安装前提
+- Toolkit 基础安装主要使用 Python 标准库，不要求额外 pip 依赖
 
 实际兼容性请运行：
 
@@ -320,11 +320,11 @@ workbuddy doctor
 
 ---
 
-## Safety & rollback
+## 安全与回退
 
 Toolkit 的安全边界比“功能更多”更重要：
 
-- Profile 保留在本机；
+- 账号配置保留在本机；
 - 加密凭据兼容不等于建立明文凭据仓库；
 - 状态替换优先采用临时文件 / 原子替换思路；
 - 后台维护任务有明确边界，不应无限等待或无限增长；
@@ -343,28 +343,28 @@ python3 uninstall.py
 
 ---
 
-## Documentation
+## 文档导航
 
-| Document | When to read it |
+| 文档 | 什么时候看 |
 |---|---|
-| [Getting Started](docs/getting-started.md) | 第一次安装和配置 |
-| [Feature Reference](docs/feature-reference.md) | 查看完整能力索引，不污染 README 主线 |
-| [Command Reference](docs/command-reference.md) | 找命令和使用场景 |
-| [Architecture](docs/architecture.md) | 理解组件边界和设计原则 |
-| [Engineering Notes](docs/engineering-notes.md) | 理解关键逆向 / 根因和设计取舍 |
-| [Incident Reports](docs/incidents/README.md) | 看真实事故、证据与修复 |
-| [ADR](docs/adr/) | 看重要架构决策记录 |
-| [Specs](docs/specs/) | 看详细规格与行为约束 |
-| [Credit Metering Spec](docs/spec-credit-metering.md) | 看积分 / 使用量计量设计 |
+| [入门指南](docs/getting-started.md) | 第一次安装和配置 |
+| [功能参考](docs/feature-reference.md) | 查看完整能力索引 |
+| [命令参考](docs/command-reference.md) | 找命令和使用场景 |
+| [架构说明](docs/architecture.md) | 理解组件边界和设计原则 |
+| [工程笔记](docs/engineering-notes.md) | 理解关键根因、逆向过程和设计取舍 |
+| [事故复盘](docs/incidents/README.md) | 看真实事故、证据与修复 |
+| [架构决策记录（ADR）](docs/adr/) | 看重要架构决策 |
+| [详细规格](docs/specs/) | 看行为约束和详细规格 |
+| [积分计量规格](docs/spec-credit-metering.md) | 看积分 / 使用量计量设计 |
 | [`llms.txt`](llms.txt) | 给 AI Agent 的轻量仓库入口 |
 
 ---
 
-## Project philosophy
+## 项目理念
 
 WorkBuddy Toolkit 不试图把所有 WorkBuddy 行为重新实现一遍。
 
-它更像一层可观察、可诊断、可回退的本地 sidecar：
+它更像一层可观察、可诊断、可回退的本地旁路：
 
 ```text
 发现真实故障
@@ -383,6 +383,6 @@ README 负责回答“这是什么、为什么需要、怎么开始”。
 
 ---
 
-## License
+## 开源协议
 
 [MIT License](LICENSE)

@@ -1,18 +1,18 @@
-# Architecture
+# 架构说明
 
-WorkBuddy Toolkit is a local sidecar around the WorkBuddy desktop client. Its goal is not to replace WorkBuddy. It adds account management, automation, diagnostics, routing and runtime guards around the existing client.
+WorkBuddy Toolkit 是围绕 WorkBuddy 桌面端运行的一层本地旁路工具。目标不是替代 WorkBuddy，而是在现有客户端外围补上多账号管理、自动化、诊断、模型路由和运行时保护。
 
-## System boundary
+## 系统边界
 
 ```text
-                     WorkBuddy Desktop
+                     WorkBuddy 桌面端
                            │
           ┌────────────────┼────────────────┐
           │                │                │
-     Credentials         SQLite          Runtime
+        凭据             SQLite          运行时
           │                │                │
           ▼                ▼                ▼
-     Profile Store   Session Sharing   Sandbox / Logs
+      账号配置库        会话共享         沙盒 / 日志
           │                │                │
           └────────────────┼────────────────┘
                            ▼
@@ -20,97 +20,99 @@ WorkBuddy Toolkit is a local sidecar around the WorkBuddy desktop client. Its go
                            │
           ┌────────────────┼────────────────┐
           │                │                │
-      Account CLI       Automation      Diagnostics
-      login/list        check-in        doctor/audit
-      switch/status     scheduling      incident tools
+       账号命令行         自动化            诊断
+       登录/列表          签到             doctor/audit
+       切换/状态          定时任务          事故取证
                            │
                            ▼
-                    Optional Router
+                       可选容灾路由
 ```
 
-The exact paths and capabilities differ by operating system and WorkBuddy version. `workbuddy doctor` is the runtime source of truth.
+不同操作系统和不同 WorkBuddy 版本的实际路径与能力可能不同。`workbuddy doctor` 的运行结果才是当前环境的事实来源。
 
-## Design principles
+## 设计原则
 
-### 1. Sidecar, not app patching
+### 1. 旁路集成，不修改应用本体
 
-Toolkit is designed to work beside WorkBuddy rather than permanently modifying the WorkBuddy application bundle. This keeps rollback practical and reduces coupling to UI files.
+Toolkit 尽量在 WorkBuddy 外部完成集成，而不是永久修改 WorkBuddy 应用包。这样更容易回退，也能降低对界面文件和内部资源的耦合。
 
-### 2. Local-first credential handling
+### 2. 凭据本地优先
 
-Saved account Profiles live on the user's machine. Newer WorkBuddy versions may store sensitive fields in encrypted envelopes. Toolkit's compatibility layer is designed to preserve that storage model instead of converting encrypted credentials into a plaintext archive.
+已保存账号配置默认只放在用户本机。较新的 WorkBuddy 版本可能把敏感字段放入加密信封。Toolkit 的兼容层尽量保持上游原有存储形式，而不是把加密凭据批量转换成明文档案。
 
-### 3. Sync before switch
+### 3. 切换前先同步
 
-WorkBuddy can refresh an access token while the client is running. A naive account switch can overwrite that newer token with an older saved file.
+WorkBuddy 运行时可能自动刷新 access token。如果切号工具直接把旧账号配置覆盖回去，就可能把较新的 Token 破坏掉。
 
-Toolkit therefore synchronizes the active credential state back into its matching Profile before replacing the active account. Writes use temporary files and replacement semantics to reduce partial-write risk.
+因此 Toolkit 会先把当前活跃账号的最新凭据状态同步回对应账号配置，再替换为目标账号。写入路径使用临时文件和替换语义，降低半写入状态的风险。
 
-### 4. Reuse WorkBuddy's session semantics
+### 4. 复用 WorkBuddy 自己的会话语义
 
-One historical failure mode was that workspaces and sessions appeared to disappear after switching accounts. The data itself was still present; WorkBuddy's query path filtered sessions by account identity.
+历史上一个典型故障是：切换账号后，工作区和历史会话看起来像消失了。
 
-Toolkit uses WorkBuddy's existing shared-session behavior so multiple local accounts can see the same workspace/session state without copying project directories.
+调查后发现，物理数据还在，变化的是 WorkBuddy 按当前账号身份过滤了会话可见性。
 
-### 5. Bounded background work
+Toolkit 因此复用 WorkBuddy 已有的共享会话语义，让多个本地账号看到同一份工作区 / 会话状态，而不是复制项目目录或维护第二套数据库。
 
-Automation and repair paths are designed around bounded work rather than unbounded retries. Examples include:
+### 5. 后台任务必须有边界
 
-- credential health checks with throttling;
-- bounded IPC operations;
-- bounded log retention;
-- size limits for runaway files;
-- single-flight/locking around repair paths where concurrent writes would be unsafe.
+自动化和修复路径都应避免无限重试或无限增长。典型规则包括：
 
-The detailed limits are implementation details and may change. Use the current source and `workbuddy doctor` when debugging a specific release.
+- 凭据健康检查要节流；
+- IPC 操作要有超时边界；
+- 日志保留要有限制；
+- 异常文件增长要有容量上限；
+- 有并发写入风险的修复路径要做互斥或单飞控制。
 
-### 6. Fail safely when upstream changes
+具体阈值属于实现细节，未来可能调整。排查具体版本时，应以当前源码和 `workbuddy doctor` 为准。
 
-WorkBuddy is an upstream dependency. Paths, credential formats and IPC behavior can change.
+### 6. 上游变化时要显式失败
 
-Toolkit therefore treats compatibility detection as a first-class feature. When an expected runtime capability is missing, `doctor` should make that visible rather than silently pretending the environment is healthy.
+WorkBuddy 是 Toolkit 无法控制的上游依赖。路径、凭据格式和 IPC 行为都可能变化。
 
-### 7. Reversible installation
+因此兼容性检测本身就是核心能力。如果关键运行时能力缺失，`doctor` 应把问题暴露出来，而不是继续给出“看起来正常”的假健康状态。
 
-Toolkit provides uninstall scripts so users can remove CLI links, background services and Toolkit-owned configuration without needing to reinstall WorkBuddy.
+### 7. 安装必须可回退
 
-## Main components
+Toolkit 提供卸载脚本，用于移除命令链接、后台服务和 Toolkit 自己维护的配置，不要求用户为了退出 Toolkit 而重装 WorkBuddy。
 
-| Component | Responsibility |
+## 主要组件
+
+| 组件 | 职责 |
 |---|---|
-| `bin/workbuddy` | Main CLI and account/tooling entry point |
-| `bin/workbuddy-log-guard` | Sandbox/log lifecycle guard |
-| `install.py` / platform installers | Installation and platform integration |
-| `sidecar/` | Runtime sidecar implementation |
-| `scripts/` | Compatibility, maintenance and supporting tasks |
-| `sql/` | Database-side support for workspace/session behavior |
-| `.github/workflows/` | CI and remote monitoring workflows |
-| `docs/incidents/` | Evidence-backed incident reports |
+| `bin/workbuddy` | 主命令行入口和账号 / 工具能力 |
+| `bin/workbuddy-log-guard` | 沙盒 / 日志生命周期保护 |
+| `install.py` / 平台安装脚本 | 安装和系统集成 |
+| `sidecar/` | 运行时旁路实现 |
+| `scripts/` | 兼容性、维护和辅助任务 |
+| `sql/` | 工作区 / 会话共享相关数据库支持 |
+| `.github/workflows/` | CI 和远端监控工作流 |
+| `docs/incidents/` | 基于证据的事故复盘 |
 
-## Two reading paths
+## 两条阅读路径
 
-### I only want to use it
+### 我只想把工具用起来
 
-Read:
+按顺序看：
 
-1. [Getting Started](getting-started.md)
-2. [Command Reference](command-reference.md)
-3. Run `workbuddy doctor` when behavior changes after a WorkBuddy update.
+1. [入门指南](getting-started.md)
+2. [命令参考](command-reference.md)
+3. WorkBuddy 更新后行为变化时先运行 `workbuddy doctor`
 
-### I want to understand why it exists
+### 我想理解它为什么这样设计
 
-Read:
+按顺序看：
 
-1. [Engineering Notes](engineering-notes.md)
-2. [Incident Reports](incidents/README.md)
-3. `docs/adr/` and `docs/specs/` for design records and detailed specifications.
+1. [工程笔记](engineering-notes.md)
+2. [事故复盘](incidents/README.md)
+3. `docs/adr/` 和 `docs/specs/` 中的架构决策与详细规格
 
-## Compatibility is a runtime property
+## 兼容性是运行时属性
 
-A README cannot guarantee that every future WorkBuddy release is compatible. The practical contract is:
+README 不能保证所有未来 WorkBuddy 版本都兼容。实际判断应运行：
 
 ```bash
 workbuddy doctor
 ```
 
-Use that result together with the repository's current release and CI state before relying on a new upstream WorkBuddy version.
+再结合当前仓库版本和 CI 状态判断是否可以依赖新的上游版本。
