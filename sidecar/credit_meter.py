@@ -20,11 +20,12 @@ import json
 import time
 import glob
 import re
+import math
 import sqlite3
 import argparse
 import urllib.request
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 
 # ANSI terminal colors (strictly disabled in non-TTY or plain mode)
 BOLD = "\033[1m"
@@ -32,15 +33,21 @@ DIM = "\033[2m"
 GREEN = "\033[32m"
 CYAN = "\033[36m"
 YELLOW = "\033[33m"
-RED = "\033[31m"
 RESET = "\033[0m"
 
 
 def sanitize_alias(alias: str) -> str:
     """Masks 11-digit mobile phone numbers for Zero-PII compliance."""
-    if re.match(r"^1[3-9]\d{9}$", alias):
-        return f"{alias[:3]}****{alias[7:]}"
-    return alias
+    if not alias:
+        return alias
+    return re.sub(r"1[3-9]\d{9}", lambda m: f"{m.group()[:3]}****{m.group()[7:]}", alias)
+
+
+def sanitize_title(title: str) -> str:
+    """Masks 11-digit mobile phone numbers in session titles."""
+    if not title:
+        return "未命名会话"
+    return re.sub(r"1[3-9]\d{9}", lambda m: f"{m.group()[:3]}****{m.group()[7:]}", title)
 
 
 class CreditMeter:
@@ -53,8 +60,12 @@ class CreditMeter:
         active_info_path: Optional[str] = None,
         workbuddy_dir: Optional[str] = None,
     ):
-        self.workbuddy_dir = workbuddy_dir or os.path.expanduser("~/.workbuddy")
-        self.db_path = db_path or os.path.join(self.workbuddy_dir, "workbuddy.db")
+        if db_path:
+            self.db_path = db_path
+            self.workbuddy_dir = workbuddy_dir or os.path.dirname(os.path.abspath(db_path))
+        else:
+            self.workbuddy_dir = workbuddy_dir or os.path.expanduser("~/.workbuddy")
+            self.db_path = os.path.join(self.workbuddy_dir, "workbuddy.db")
         self.profiles_dir = profiles_dir or os.path.join(self.workbuddy_dir, "auth_profiles")
         self.active_info_path = active_info_path or self._resolve_default_active_info()
 
@@ -115,8 +126,8 @@ class CreditMeter:
 
         # Explicit date range
         if from_str:
-            from_dt = self._parse_datetime(from_str)
-            to_dt = self._parse_datetime(to_str) if to_str else now
+            from_dt = self._parse_datetime(from_str, is_end_of_day=False)
+            to_dt = self._parse_datetime(to_str, is_end_of_day=True) if to_str else now
             from_ts = int(from_dt.timestamp() * 1000)
             to_ts = int(to_dt.timestamp() * 1000)
             dur_sec = max(int((to_ts - from_ts) / 1000), 1)
@@ -127,6 +138,7 @@ class CreditMeter:
                 "from_timestamp": from_ts,
                 "to_timestamp": to_ts,
                 "duration_seconds": dur_sec,
+                "is_explicit_to": bool(to_str),
             }
 
         # Yesterday full 24h
@@ -146,7 +158,7 @@ class CreditMeter:
 
         # Relative since duration (e.g., 30m, 1h, 2h, 7d)
         if since:
-            dur_sec = self._parse_duration(since)
+            dur_sec = max(self._parse_duration(since), 1)
             from_dt = now - timedelta(seconds=dur_sec)
             from_ts = int(from_dt.timestamp() * 1000)
             to_ts = int(now.timestamp() * 1000)
@@ -182,14 +194,66 @@ class CreditMeter:
             "duration_seconds": dur_sec,
         }
 
+    def refresh_window(self, window: Dict[str, Any], now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+        """Dynamically advances the end boundary (and rolling start boundary) for live watch loops."""
+        w_type = window.get("type")
+        if w_type == "range" and window.get("is_explicit_to"):
+            return window  # Fixed historical range, do not slide
+        if w_type == "yesterday":
+            return window  # Fixed yesterday 24h, do not slide
+
+        now = now_dt or datetime.now()
+        now_ts = int(now.timestamp() * 1000)
+
+        if w_type == "since":
+            dur_sec = max(int(window.get("duration_seconds", 3600)), 1)
+            from_ts = now_ts - dur_sec * 1000
+            return {
+                **window,
+                "from_timestamp": from_ts,
+                "to_timestamp": now_ts,
+                "duration_seconds": dur_sec,
+            }
+        elif w_type == "today":
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            from_ts = int(today_start.timestamp() * 1000)
+            dur_sec = max(int((now_ts - from_ts) / 1000), 1)
+            return {
+                **window,
+                "from_timestamp": from_ts,
+                "to_timestamp": now_ts,
+                "duration_seconds": dur_sec,
+            }
+        elif w_type == "all":
+            return {
+                **window,
+                "to_timestamp": now_ts,
+                "duration_seconds": max(int(now.timestamp()), 1),
+            }
+        else:
+            from_ts = window.get("from_timestamp", 0)
+            dur_sec = max(int((now_ts - from_ts) / 1000), 1)
+            return {
+                **window,
+                "to_timestamp": now_ts,
+                "duration_seconds": dur_sec,
+            }
+
     @staticmethod
-    def _parse_datetime(val: str) -> datetime:
+    def _parse_datetime(val: str, is_end_of_day: bool = False) -> datetime:
         val = val.strip()
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
             try:
                 return datetime.strptime(val, fmt)
             except ValueError:
                 pass
+        try:
+            dt = datetime.strptime(val, "%Y-%m-%d")
+            if is_end_of_day:
+                return dt.replace(hour=23, minute=59, second=59, microsecond=999000)
+            return dt
+        except ValueError:
+            pass
         raise ValueError(f"无法识别的时间格式: '{val}'。支持格式: YYYY-MM-DD 或 YYYY-MM-DD HH:MM")
 
     @staticmethod
@@ -210,18 +274,24 @@ class CreditMeter:
 
     @staticmethod
     def extract_turn_timestamp(req_id: str, fallback_ts: int) -> int:
-        """Extracts UUIDv7 millisecond epoch timestamp with sanity boundaries.
+        """Extracts UUIDv7 millisecond epoch timestamp with RFC 9562 verification.
         
         Sanity boundary: 1700000000000 <= ts <= 1900000000000 (Nov 2023 ~ Mar 2030).
-        Protects against random MD5 hashes being erroneously parsed as future timestamps.
+        For UUID strings >= 13 hex chars, verifies version nibble is '7' (RFC 9562).
+        Falls back to session updated_at for UUIDv4, MD5 hashes, or invalid IDs.
         """
-        if isinstance(req_id, str) and len(req_id) >= 12:
-            try:
-                candidate = int(req_id[:12], 16)
-                if 1700000000000 <= candidate <= 1900000000000:
-                    return candidate
-            except Exception:
-                pass
+        if isinstance(req_id, str):
+            clean_id = req_id.replace("-", "").strip().lower()
+            if len(clean_id) >= 12:
+                try:
+                    candidate = int(clean_id[:12], 16)
+                    if 1700000000000 <= candidate <= 1900000000000:
+                        # RFC 9562: UUID version nibble (index 12) must be '7'
+                        if len(clean_id) >= 13 and clean_id[12] != "7":
+                            return fallback_ts
+                        return candidate
+                except Exception:
+                    pass
         return fallback_ts
 
     def load_active_uid(self) -> Optional[str]:
@@ -316,7 +386,9 @@ class CreditMeter:
                         if not isinstance(cj, dict):
                             continue
                         for req_id, pts in cj.items():
-                            if not isinstance(pts, (int, float)):
+                            if isinstance(pts, bool) or not isinstance(pts, (int, float)):
+                                continue
+                            if not math.isfinite(pts) or pts < 0:
                                 continue
                             ts = self.extract_turn_timestamp(req_id, updated_at or 0)
                             if from_ts <= ts <= to_ts:
@@ -356,7 +428,7 @@ class CreditMeter:
             total_active_turns += acc_turns
 
             account_rows.append({
-                "alias": alias,
+                "alias": sanitize_alias(alias),
                 "is_active": is_active,
                 "uid_short": prof["uid_short"],
                 "credits": acc_creds_rounded,
@@ -391,12 +463,15 @@ class CreditMeter:
             "burn_rate_pts_per_sec": overall_burn_rate,
             "window_rate_pts_per_sec": window_rate,
             "total_sessions": total_sessions,
-            "active_account": active_account_name,
+            "active_account": sanitize_alias(active_account_name) if active_account_name else None,
             "accounts": account_rows,
         }
 
     def query_account_drilldown(self, target: str, window: Dict[str, Any]) -> Dict[str, Any]:
         """Drills down into conversation sessions for a specific account."""
+        if not target or not target.strip():
+            raise ValueError("查询账号不能为空。可通过 'wb-list' 查看已保存账号。")
+
         profiles = self.load_profiles()
         matched_alias = None
         matched_prof = None
@@ -445,7 +520,9 @@ class CreditMeter:
                         if not isinstance(cj, dict):
                             continue
                         for req_id, pts in cj.items():
-                            if not isinstance(pts, (int, float)):
+                            if isinstance(pts, bool) or not isinstance(pts, (int, float)):
+                                continue
+                            if not math.isfinite(pts) or pts < 0:
                                 continue
                             ts = self.extract_turn_timestamp(req_id, updated_at or 0)
                             if from_ts <= ts <= to_ts:
@@ -455,13 +532,17 @@ class CreditMeter:
                     except Exception:
                         pass
 
-                # Query session titles
+                # Query session titles in chunks to avoid SQLite variable limit
                 if sids:
-                    placeholders = ",".join("?" for _ in sids)
-                    cur.execute(f"SELECT id, title, custom_title, updated_at FROM sessions WHERE id IN ({placeholders})", sids)
-                    for sid, title, custom_title, upd in cur.fetchall():
-                        titles_map[sid] = custom_title or title or "未命名会话"
-                        db_updated_map[sid] = upd or 0
+                    batch_size = 500
+                    for i in range(0, len(sids), batch_size):
+                        batch = sids[i:i + batch_size]
+                        placeholders = ",".join("?" for _ in batch)
+                        cur.execute(f"SELECT id, title, custom_title, updated_at FROM sessions WHERE id IN ({placeholders})", batch)
+                        for sid, title, custom_title, upd in cur.fetchall():
+                            raw_t = custom_title or title or "未命名会话"
+                            titles_map[sid] = sanitize_title(raw_t)
+                            db_updated_map[sid] = upd or 0
             except Exception:
                 pass
             finally:
@@ -505,7 +586,7 @@ class CreditMeter:
 
         return {
             "window": window,
-            "account": matched_alias,
+            "account": sanitize_alias(matched_alias),
             "is_active": matched_prof["is_active"],
             "uid_short": matched_prof["uid_short"],
             "total_credits": total_creds,
@@ -515,7 +596,7 @@ class CreditMeter:
         }
 
     @staticmethod
-    def render_overview(data: Dict[str, Any], use_color: bool = True, use_unicode_bar: bool = True) -> str:
+    def render_overview(data: Dict[str, Any], use_color: bool = True, use_unicode_bar: bool = True, verbose: bool = False) -> str:
         """Human TTY layout (ABC combined micro-card + progress bars)."""
         c_bold = BOLD if use_color else ""
         c_dim = DIM if use_color else ""
@@ -534,6 +615,10 @@ class CreditMeter:
             f"生成流速: {c_yellow}{data['burn_rate_pts_per_sec']:.1f} pts/s{c_reset}     "
             f"活跃会话: {c_bold}{data['total_sessions']}{c_reset}   {c_dim}│{c_reset}"
         )
+        if verbose:
+            dur = data["window"].get("duration_seconds", 0)
+            w_rate = data.get("window_rate_pts_per_sec", 0.0)
+            lines.append(f"{c_dim}│{c_reset}  采样跨度: {dur}s         均摊流速: {w_rate:.4f} pts/s  {c_dim}│{c_reset}")
         lines.append(f"{c_dim}╰──────────────────────────────────────────────────────────────────╯{c_reset}")
         lines.append("")
 
@@ -602,8 +687,8 @@ class CreditMeter:
 
     @staticmethod
     def to_json(data: Dict[str, Any]) -> str:
-        """Strict machine-readable JSON for AI agent ingestion."""
-        return json.dumps(data, indent=2, ensure_ascii=False)
+        """Strict machine-readable JSON for AI agent ingestion (RFC 8259)."""
+        return json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False)
 
     def watch_loop(
         self,
@@ -614,7 +699,7 @@ class CreditMeter:
         use_color: bool = True,
         use_unicode_bar: bool = True,
     ):
-        """Live continuous monitor loop with instantaneous burn rate sampling."""
+        """Live continuous monitor loop with dynamic window rolling and instantaneous burn rate sampling."""
         c_bold = BOLD if use_color else ""
         c_cyan = CYAN if use_color else ""
         c_yellow = YELLOW if use_color else ""
@@ -624,12 +709,13 @@ class CreditMeter:
         prev_credits = 0.0
         prev_time = time.time()
 
-        # Initial sample
+        # Initial sample with refreshed rolling window
+        curr_window = self.refresh_window(window)
         if account:
-            initial_data = self.query_account_drilldown(account, window)
+            initial_data = self.query_account_drilldown(account, curr_window)
             prev_credits = initial_data["total_credits"]
         else:
-            initial_data = self.query_usage(window)
+            initial_data = self.query_usage(curr_window)
             prev_credits = initial_data["total_credits"]
 
         try:
@@ -638,11 +724,12 @@ class CreditMeter:
                 curr_time = time.time()
                 elapsed = max(curr_time - prev_time, 0.001)
 
+                curr_window = self.refresh_window(window)
                 if account:
-                    data = self.query_account_drilldown(account, window)
+                    data = self.query_account_drilldown(account, curr_window)
                     rendered = self.render_drilldown(data, use_color=use_color)
                 else:
-                    data = self.query_usage(window)
+                    data = self.query_usage(curr_window)
                     rendered = self.render_overview(data, use_color=use_color, use_unicode_bar=use_unicode_bar)
 
                 curr_credits = data["total_credits"]
@@ -698,11 +785,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(
+    argv: Optional[List[str]] = None,
+    db_path: Optional[str] = None,
+    profiles_dir: Optional[str] = None,
+    active_info_path: Optional[str] = None,
+    workbuddy_dir: Optional[str] = None,
+) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    meter = CreditMeter()
+    if args.watch and args.json:
+        sys.stderr.write("错误: --watch 交互式监视模式暂不支持与 --json 同时使用。\n")
+        return 1
+
+    meter = CreditMeter(
+        db_path=db_path,
+        profiles_dir=profiles_dir,
+        active_info_path=active_info_path,
+        workbuddy_dir=workbuddy_dir,
+    )
 
     try:
         window = meter.parse_time_window(
@@ -724,14 +826,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Watch loop
     if args.watch:
-        meter.watch_loop(
-            window=window,
-            interval=2.0,
-            account=args.account,
-            use_color=use_color,
-            use_unicode_bar=use_unicode_bar,
-        )
-        return 0
+        try:
+            meter.watch_loop(
+                window=window,
+                interval=2.0,
+                account=args.account,
+                use_color=use_color,
+                use_unicode_bar=use_unicode_bar,
+            )
+            return 0
+        except ValueError as e:
+            sys.stderr.write(f"错误: {e}\n")
+            return 1
+        except Exception as e:
+            sys.stderr.write(f"监视异常: {e}\n")
+            return 1
 
     try:
         if args.account:
@@ -745,7 +854,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.json:
                 print(meter.to_json(data))
             else:
-                print(meter.render_overview(data, use_color=use_color, use_unicode_bar=use_unicode_bar))
+                print(meter.render_overview(data, use_color=use_color, use_unicode_bar=use_unicode_bar, verbose=args.verbose))
         return 0
     except ValueError as e:
         sys.stderr.write(f"错误: {e}\n")

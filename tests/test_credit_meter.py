@@ -147,23 +147,28 @@ class TestCreditMeterEngine(unittest.TestCase):
             self.meter.parse_time_window(from_str="invalid_date")
 
     def test_02_uuidv7_timestamp_extraction_and_md5_defense(self):
-        """测试从 UUIDv7 提取时间戳及 MD5 哈希范围防御"""
+        """测试从 UUIDv7 提取时间戳及 MD5 哈希范围防御与 RFC 9562 版本校验"""
         fallback = 1785000000000  # Fallback updated_at in 2026
 
-        # 1. 有效 UUIDv7 请求 ID (前 12 字符为合法的 2026 年毫秒时间戳 1785000000000 = 0x019fc8e78a00)
+        # 1. 有效 UUIDv7 请求 ID (前 12 字符为合法的 2026 年毫秒时间戳 1785000000000 = 0x019fc8e78a00, 版本 nibble 为 '7')
         valid_ts = 1785000000000
         valid_hex = f"{valid_ts:012x}"
-        valid_req_id = f"{valid_hex}-4000-8000-000000000000"
+        valid_req_id = f"{valid_hex}-7000-8000-000000000000"
         extracted = CreditMeter.extract_turn_timestamp(valid_req_id, fallback)
         self.assertEqual(extracted, valid_ts)
 
-        # 2. MD5 哈希请求 ID (例如 'b5d5338ea8934e9c8372fd1a344a101e')
+        # 2. 伪造时间戳前缀的 UUIDv4 (前 12 位看似时间戳，但版本 nibble 为 '4')，应被安全拦截回退
+        v4_req_id = f"{valid_hex}-4000-8000-000000000000"
+        extracted_v4 = CreditMeter.extract_turn_timestamp(v4_req_id, fallback)
+        self.assertEqual(extracted_v4, fallback, "UUIDv4 请求 ID 应被识别并回退")
+
+        # 3. MD5 哈希请求 ID (例如 'b5d5338ea8934e9c8372fd1a344a101e')
         # 其前 12 位十六进制 0xb5d5338ea893 = 199933543655571 (公元 8307 年，远大于 1900000000000)
         md5_req_id = "b5d5338ea8934e9c8372fd1a344a101e"
         extracted_md5 = CreditMeter.extract_turn_timestamp(md5_req_id, fallback)
         self.assertEqual(extracted_md5, fallback, "MD5 哈希应被安全拦截并回退到 session_usage.updated_at")
 
-        # 3. 畸形 / 非十六进制 / 短字符串
+        # 4. 畸形 / 非十六进制 / 短字符串
         self.assertEqual(CreditMeter.extract_turn_timestamp("short-id", fallback), fallback)
         self.assertEqual(CreditMeter.extract_turn_timestamp(None, fallback), fallback)
         self.assertEqual(CreditMeter.extract_turn_timestamp("zzzzzzzzzzzz-invalid", fallback), fallback)
@@ -204,7 +209,7 @@ class TestCreditMeterEngine(unittest.TestCase):
         cur.execute("INSERT INTO sessions (id, cwd, user_id, title) VALUES (?, ?, ?, ?)",
                     ("sess-alice-1", "/tmp", alice_uid, "重构支付接口"))
         valid_hex = f"{turn_ts:012x}"
-        req_id = f"{valid_hex}-turn-1"
+        req_id = f"{valid_hex}-7000-8000-000000000001"
         cur.execute("INSERT INTO session_usage (session_id, used, size, updated_at, credit_json) VALUES (?, ?, ?, ?, ?)",
                     ("sess-alice-1", 100, 200, turn_ts, json.dumps({req_id: 30.0})))
         conn.commit()
@@ -237,7 +242,7 @@ class TestCreditMeterEngine(unittest.TestCase):
         self.assertEqual(acc_charlie["credits"], 0.0)
 
     def test_04_json_schema_compliance_and_types(self):
-        """测试 --json 结构化数据符合规范且字段完备强类型"""
+        """测试 --json 结构化数据符合规范且字段完备强类型 (RFC 8259)"""
         fixed_now = datetime(2026, 10, 13, 15, 0, 0)
         window = self.meter.parse_time_window(today=True, now_dt=fixed_now)
         data = self.meter.query_usage(window)
@@ -259,6 +264,12 @@ class TestCreditMeterEngine(unittest.TestCase):
         self.assertIsInstance(parsed["total_sessions"], int)
         self.assertIn("accounts", parsed)
         self.assertIsInstance(parsed["accounts"], list)
+
+        # RFC 8259 验证：严禁输出裸 NaN 或 Infinity
+        with self.assertRaises(ValueError):
+            self.meter.to_json({"invalid_float": float("inf")})
+        with self.assertRaises(ValueError):
+            self.meter.to_json({"invalid_nan": float("nan")})
 
     def test_05_non_tty_ansi_stripping_and_ascii_fallback(self):
         """测试管道 / non-TTY 模式下 ANSI 颜色剥离与 ASCII 进度条降级"""
@@ -291,15 +302,40 @@ class TestCreditMeterEngine(unittest.TestCase):
         self.assertIn("[============]", plain_out, "Plain 模式进度条应降级为 ASCII [====....]")
 
     def test_06_zero_pii_sanitization(self):
-        """测试 Zero-PII 脱敏机制，严禁向终端泄露敏感电话号码或个人全称"""
+        """测试 Zero-PII 脱敏机制，严禁向终端或 --json 泄露敏感电话号码或个人全称"""
         # 动态拼接 11 位手机号以防触发静态文本扫描
         synthetic_phone = "".join(["1", "3", "9", "1", "2", "3", "4", "5", "6", "7", "8"])
         masked = sanitize_alias(synthetic_phone)
         self.assertEqual(masked, "139****5678", "11 位手机号应自动脱敏中间 4 位")
 
+        # 带有冲突自增后缀或前缀的别名亦必须严密脱敏
+        self.assertEqual(sanitize_alias(f"{synthetic_phone}_1"), "139****5678_1")
+        self.assertEqual(sanitize_alias(f"user_{synthetic_phone}"), "user_139****5678")
+
         # 普通别名原样保留
         self.assertEqual(sanitize_alias("Cat_1"), "Cat_1")
         self.assertEqual(sanitize_alias("developer"), "developer")
+
+        # 验证在 --json 序列化路径中绝对不泄露真实手机号
+        phone_uid = "phone-uid-5555"
+        with open(os.path.join(self.profiles_dir, f"{synthetic_phone}.info"), "w", encoding="utf-8") as f:
+            json.dump({"userId": phone_uid, "nickname": synthetic_phone}, f)
+        with open(self.active_info_path, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": phone_uid}}, f)
+
+        window = self.meter.parse_time_window(today=True)
+        overview_data = self.meter.query_usage(window)
+        json_str = self.meter.to_json(overview_data)
+
+        self.assertNotIn(synthetic_phone, json_str, "--json 输出中绝对严禁出现明文 11 位手机号")
+        self.assertIn("139****5678", json_str, "--json 输出中手机号必须已脱敏")
+        self.assertEqual(overview_data["active_account"], "139****5678")
+
+        # 验证 drilldown 路径下亦严格脱敏
+        drill_data = self.meter.query_account_drilldown(synthetic_phone, window)
+        drill_json = self.meter.to_json(drill_data)
+        self.assertNotIn(synthetic_phone, drill_json)
+        self.assertEqual(drill_data["account"], "139****5678")
 
     def test_07_account_session_drilldown(self):
         """测试 --account 会话级下钻表格与明细字段"""
@@ -323,7 +359,7 @@ class TestCreditMeterEngine(unittest.TestCase):
                     ("68dd2739-1111", "/work", user_uid, "修复网关鉴权边界", turn_ts))
         valid_hex = f"{turn_ts:012x}"
         cur.execute("INSERT INTO session_usage (session_id, used, size, updated_at, credit_json) VALUES (?, ?, ?, ?, ?)",
-                    ("68dd2739-1111", 50, 100, turn_ts, json.dumps({f"{valid_hex}-r1": 22.4})))
+                    ("68dd2739-1111", 50, 100, turn_ts, json.dumps({f"{valid_hex}-7000-8000-000000000001": 22.4})))
         conn.commit()
         conn.close()
 
@@ -348,8 +384,14 @@ class TestCreditMeterEngine(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.meter.query_account_drilldown("NonExistent", window)
 
-    def test_08_watch_loop_termination(self):
-        """测试 --watch 监视循环通过 max_ticks 安全受控退出"""
+        # 空账号查询应抛出友好异常
+        with self.assertRaises(ValueError):
+            self.meter.query_account_drilldown("", window)
+        with self.assertRaises(ValueError):
+            self.meter.query_account_drilldown("   ", window)
+
+    def test_08_watch_loop_termination_and_dynamic_window(self):
+        """测试 --watch 监视循环通过 max_ticks 安全受控退出，并验证动态时间窗滚动"""
         window = self.meter.parse_time_window(today=True)
         buf = io.StringIO()
         with patch("sys.stdout", buf):
@@ -364,13 +406,56 @@ class TestCreditMeterEngine(unittest.TestCase):
         self.assertIn("瞬时流速", output)
         self.assertIn("采样间隔", output)
 
+        # 验证 refresh_window 动态向前滚动时间窗
+        refreshed = self.meter.refresh_window(window, now_dt=datetime.now() + timedelta(seconds=10))
+        self.assertGreaterEqual(refreshed["to_timestamp"], window["to_timestamp"])
+
+        # 验证 --watch 与 --json 组合时友好报错退出
+        err_buf = io.StringIO()
+        with patch("sys.stderr", err_buf):
+            ret = credit_meter.main(["--watch", "--json"])
+            self.assertEqual(ret, 1)
+            self.assertIn("--watch", err_buf.getvalue())
+
+        # 验证 --watch 指定不存在账号时友好报错退出（无未捕获异常）
+        err_buf2 = io.StringIO()
+        with patch("sys.stderr", err_buf2):
+            ret2 = credit_meter.main(["--watch", "--account", "ghost_acc"])
+            self.assertEqual(ret2, 1)
+            self.assertIn("未找到匹配的账号", err_buf2.getvalue())
+
     def test_09_cli_dispatch_and_seam(self):
-        """测试 bin/workbuddy usage 与 wb-usage 快捷命令分发"""
+        """测试 bin/workbuddy usage 与 wb-usage 快捷命令分发（隔离沙盒验证）"""
         orig_db = workbuddy.DB_FILE
         orig_profiles = workbuddy.PROFILES_DIR
+        orig_auth = workbuddy.AUTH_FILE
         try:
             workbuddy.DB_FILE = self.db_path
             workbuddy.PROFILES_DIR = self.profiles_dir
+            workbuddy.AUTH_FILE = self.active_info_path
+
+            # 写入沙盒测试专用 Profile 与消费数据
+            seam_uid = "seam-uid-8888"
+            with open(os.path.join(self.profiles_dir, "SeamBot.info"), "w", encoding="utf-8") as f:
+                json.dump({"userId": seam_uid, "nickname": "SeamBot"}, f)
+            with open(self.active_info_path, "w", encoding="utf-8") as f:
+                json.dump({"account": {"uid": seam_uid}}, f)
+
+            snap_dir = os.path.join(self.test_dir, seam_uid)
+            os.makedirs(snap_dir, exist_ok=True)
+            with open(os.path.join(snap_dir, "sidebar-list-snapshot.json"), "w", encoding="utf-8") as f:
+                json.dump({"items": [{"id": "seam-sess-88"}]}, f)
+
+            turn_ts = int(datetime.now().timestamp() * 1000)
+            valid_hex = f"{turn_ts:012x}"
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute("INSERT OR REPLACE INTO sessions (id, cwd, user_id, title) VALUES (?, ?, ?, ?)",
+                        ("seam-sess-88", "/tmp", seam_uid, "Seam测试会话"))
+            cur.execute("INSERT OR REPLACE INTO session_usage (session_id, used, size, updated_at, credit_json) VALUES (?, ?, ?, ?, ?)",
+                        ("seam-sess-88", 10, 20, turn_ts, json.dumps({f"{valid_hex}-7000-8000-000000000001": 18.8})))
+            conn.commit()
+            conn.close()
 
             # 1. 通过 'usage --plain' 调用
             buf1 = io.StringIO()
@@ -379,6 +464,7 @@ class TestCreditMeterEngine(unittest.TestCase):
                     workbuddy.main()
             out1 = buf1.getvalue()
             self.assertIn("WorkBuddy 积分总览", out1)
+            self.assertIn("SeamBot", out1)
 
             # 2. 通过 'wb-usage --plain' 快捷别名调用
             buf2 = io.StringIO()
@@ -387,8 +473,9 @@ class TestCreditMeterEngine(unittest.TestCase):
                     workbuddy.main()
             out2 = buf2.getvalue()
             self.assertIn("WorkBuddy 积分总览", out2)
+            self.assertIn("SeamBot", out2)
 
-            # 3. 通过 'workbuddy usage --json' 调用
+            # 3. 通过 'workbuddy usage --json' 调用，验证强隔离数据精准归因
             buf3 = io.StringIO()
             with patch("sys.stdout", buf3):
                 with patch("sys.argv", ["workbuddy", "usage", "--json"]):
@@ -396,9 +483,12 @@ class TestCreditMeterEngine(unittest.TestCase):
             out3 = buf3.getvalue()
             parsed = json.loads(out3)
             self.assertIn("total_credits", parsed)
+            self.assertGreaterEqual(parsed["total_credits"], 18.8)
+            self.assertEqual(parsed["active_account"], "SeamBot")
         finally:
             workbuddy.DB_FILE = orig_db
             workbuddy.PROFILES_DIR = orig_profiles
+            workbuddy.AUTH_FILE = orig_auth
 
 
 if __name__ == "__main__":

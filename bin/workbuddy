@@ -3786,6 +3786,9 @@ def run_sandbox_cmd(args):
             print(f"  (检测到用户活跃进程，跳过守护进程回收以保护工作现场)")
         elif reap_res.get("reason") == "sandbox_cli_active":
             print(f"  (检测到沙盒中存在活跃任务，跳过守护进程回收)")
+        print()
+
+    else:
         print(f"用法: workbuddy sandbox [status|heal|clean] [--json] (别名: wb-sandbox)")
 
 def run_usage_cmd(args):
@@ -3797,7 +3800,12 @@ def run_usage_cmd(args):
     old_argv = sys.argv
     try:
         sys.argv = [sys.argv[0]] + list(args)
-        code = credit_meter.main(list(args))
+        code = credit_meter.main(
+            list(args),
+            db_path=DB_FILE,
+            profiles_dir=PROFILES_DIR,
+            active_info_path=AUTH_FILE,
+        )
         if code != 0:
             sys.exit(code)
     finally:
