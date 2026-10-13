@@ -128,6 +128,11 @@ def install_cli():
             with open(os.path.join(bin_dir, name), "w", encoding="ascii") as f:
                 f.write(cmd_help)
 
+        cmd_usage = "@echo off\r\ncall \"%~dp0workbuddy.cmd\" usage %*\r\n"
+        for name in ["wb-usage.cmd", "workbuddy-usage.cmd"]:
+            with open(os.path.join(bin_dir, name), "w", encoding="ascii") as f:
+                f.write(cmd_usage)
+
         src_log_guard = os.path.join(SCRIPT_DIR, "bin", "workbuddy-log-guard")
         if os.path.exists(src_log_guard):
             dest_log_guard = os.path.join(bin_dir, "workbuddy-log-guard")
@@ -207,6 +212,7 @@ def install_cli():
             "wb-chat", "workbuddy-chat",
             "wb-doctor", "workbuddy-doctor",
             "wb-models", "workbuddy-models",
+            "wb-usage", "workbuddy-usage",
             "wb-router", "workbuddy-router",
             "wb-sandbox", "workbuddy-sandbox"
         ]:

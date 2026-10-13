@@ -61,6 +61,8 @@ class TestInstallersE2E(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-checkin.cmd")))
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-chat.cmd")))
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-doctor.cmd")))
+            self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-usage.cmd")))
+            self.assertTrue(os.path.exists(os.path.join(bin_dir, "workbuddy-usage.cmd")))
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-sandbox.cmd")))
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "workbuddy-log-guard.cmd")))
         else:
@@ -79,6 +81,8 @@ class TestInstallersE2E(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-checkin")))
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-chat")))
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-doctor")))
+            self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-usage")))
+            self.assertTrue(os.path.exists(os.path.join(bin_dir, "workbuddy-usage")))
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-sandbox")))
 
         # 3. 运行卸载器（输入 n 回答不回滚数据库）
@@ -94,6 +98,8 @@ class TestInstallersE2E(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "workbuddy-list.cmd")))
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "wb-status.cmd")))
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "workbuddy-status.cmd")))
+            self.assertFalse(os.path.exists(os.path.join(bin_dir, "wb-usage.cmd")))
+            self.assertFalse(os.path.exists(os.path.join(bin_dir, "workbuddy-usage.cmd")))
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "wb-sandbox.cmd")))
         else:
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "workbuddy-log-guard")))
@@ -103,6 +109,8 @@ class TestInstallersE2E(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "workbuddy-list")))
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "wb-status")))
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "workbuddy-status")))
+            self.assertFalse(os.path.exists(os.path.join(bin_dir, "wb-usage")))
+            self.assertFalse(os.path.exists(os.path.join(bin_dir, "workbuddy-usage")))
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "wb-sandbox")))
 
         # 验证 ~/.workbuddy/toolkit 伴随组件目录已物理 100% 移除

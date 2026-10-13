@@ -138,6 +138,7 @@ def uninstall():
             "wb-chat", "workbuddy-chat",
             "wb-doctor", "workbuddy-doctor",
             "wb-models", "workbuddy-models",
+            "wb-usage", "workbuddy-usage",
             "wb-router", "workbuddy-router",
             "wb-sandbox", "workbuddy-sandbox"
         ]:

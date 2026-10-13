@@ -3786,9 +3786,22 @@ def run_sandbox_cmd(args):
             print(f"  (检测到用户活跃进程，跳过守护进程回收以保护工作现场)")
         elif reap_res.get("reason") == "sandbox_cli_active":
             print(f"  (检测到沙盒中存在活跃任务，跳过守护进程回收)")
-        print()
-    else:
         print(f"用法: workbuddy sandbox [status|heal|clean] [--json] (别名: wb-sandbox)")
+
+def run_usage_cmd(args):
+    """调用积分消耗与流速统计引擎 (wb-usage)"""
+    sidecar_dir = find_sidecar_dir()
+    if sidecar_dir not in sys.path:
+        sys.path.insert(0, sidecar_dir)
+    import credit_meter
+    old_argv = sys.argv
+    try:
+        sys.argv = [sys.argv[0]] + list(args)
+        code = credit_meter.main(list(args))
+        if code != 0:
+            sys.exit(code)
+    finally:
+        sys.argv = old_argv
 
 def _parse_audit_cli_args(args_list):
     force = any(a in ("--force", "-f") for a in args_list)
@@ -3842,6 +3855,7 @@ def print_help():
   workbuddy switch [账号名]        免重新扫码切换账号 (别名: wb-switch)
   workbuddy list / status [--json] 查看账号列表与凭证状态 (别名: wb-list, wb-status)
   workbuddy audit [--daemon]      凭据健康审计与常驻巡检 (别名: wb-audit)
+  workbuddy usage [选项]           积分消耗与流速统计 (别名: wb-usage)
   workbuddy checkin [账号名]      每日签到与保活对话 (别名: wb-checkin)
   workbuddy chat [提示词] [--all]  终端快速调用模型对话 (别名: wb-chat)
   workbuddy models [--list|--json] 查看/切换可用模型与倍率 (别名: wb-models)
@@ -3920,6 +3934,9 @@ def main():
     if "sandbox" in prog_name:
         run_sandbox_cmd(args)
         return
+    if clean_prog in ("wb-usage", "workbuddy-usage") or clean_prog.endswith(("-usage",)):
+        run_usage_cmd(args)
+        return
 
     if not args:
         interactive_menu()
@@ -3952,6 +3969,9 @@ def main():
             return
         ok = run_audit(force=force, notify_on_expired=True)
         sys.exit(0 if ok else 1)
+    elif cmd in ["usage", "use-stat", "credits", "credit", "pts"]:
+        run_usage_cmd(args[1:])
+        return
     elif cmd in ["models", "model"]:
         run_models_cmd(args[1:])
     elif cmd in ["router"]:

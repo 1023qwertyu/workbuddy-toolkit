@@ -1,0 +1,3 @@
+# Deep Module Seam for Credit Metering (`sidecar/credit_meter.py`)
+
+To satisfy Matt Pocock's codebase design principles (Small Interface, Deep Implementation, Zero-Bloat) and prevent regressions to existing authentication, routing, and log-guard subsystems, all SQLite reading, UUIDv7 / turn timestamp extraction, account snapshot attribution, and burn rate computations are encapsulated in an isolated module `sidecar/credit_meter.py`. The CLI entrypoint `bin/workbuddy` connects to it via a minimal seam (`workbuddy usage` / `wb-usage`), ensuring the feature cleanly passes the Deletion Test with near-zero blast radius.
