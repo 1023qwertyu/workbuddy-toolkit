@@ -2,7 +2,7 @@
 
 [![CI: Cross-Platform Matrix](https://github.com/FlapPearLabs/workbuddy-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit/actions/workflows/ci.yml)
 [![Release: v0.6.0](https://img.shields.io/badge/Release-v0.6.0-blue.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit)
-[![Tests: 130/130 Passed](https://img.shields.io/badge/Tests-130%2F130%20Passed-brightgreen.svg)](tests/)
+[![Tests: 139/139 Passed](https://img.shields.io/badge/Tests-139%2F139%20Passed-brightgreen.svg)](tests/)
 [![Security: Zero-Leak](https://img.shields.io/badge/Security-Zero--Leak%20Audit%20Passed-success.svg)](.github/workflows/ci.yml)
 [![Platform: macOS | Linux | Windows](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-brightgreen.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit)
 [![Python: 3.8+](https://img.shields.io/badge/Python-3.8+-green.svg)](https://python.org)
@@ -37,7 +37,7 @@
      如实告诉我当前环境没有内置 Agent 调度能力，并请我选择签到方式：
      ① 采用安装脚本已配置的系统原生守护定时打卡（macOS launchd / Linux systemd timer / Windows 任务计划程序，每天 09:00 静默打卡写入日志）；
      ② 完全关闭后台自动打卡，后续每次由我手动在终端输入 `wb-checkin` 随时打卡。
-7. 向我汇报最终安装与配置结果，并指导我如何使用 `wb-help`（查看可用命令与功能列表）、`wb-login`（免打开客户端扫码入库）、`wb-list` / `wb-status`（账号状态全景与 JSON）、`wb-switch`（免扫码秒切账号）、`wb-checkin`（签到+对话）、`wb-chat`（CLI 直接调用模型）、`wb-router`（容灾轮换路由）、`wb-models`（模型透视）以及 `wb-doctor`（兼容诊断）。
+7. 向我汇报最终安装与配置结果，并指导我如何使用 `wb-help`（查看可用命令与功能列表）、`wb-usage`（积分消耗与流速统计）、`wb-login`（免打开客户端扫码入库）、`wb-list` / `wb-status`（账号状态全景与 JSON）、`wb-switch`（免扫码秒切账号）、`wb-checkin`（签到+对话）、`wb-chat`（CLI 直接调用模型）、`wb-router`（容灾轮换路由）、`wb-models`（模型透视）以及 `wb-doctor`（兼容诊断）。
 ```
 
 ---
@@ -69,6 +69,7 @@
 | **规则雪崩与并发撕裂** | 漏配临时目录导致 1.7 万行规则膨胀卡死 120s SIGKILL；多进程并发自愈易破坏规则文件 | **Single-Flight 内核锁防撕裂 (`wb-sandbox heal`)**：动态通配规则降至 48 条，跨进程排他锁 (`fcntl.flock` / `msvcrt`) + 锁内回读校验，并发 0 冲突 |
 | **IPC 慢连接与头阻塞** | 传统 IPC 无全局超时与帧长限制，遇慢响应或超长 Payload 拖死命令执行 | **全链路 Monotonic Deadline + 4MB 硬熔断**：覆盖连接、发送与分片接收全时钟周期，100% Fail-Open 绝不卡死用户命令 |
 | **子进程与转储隔离** | 子进程默认继承父进程打开句柄；意外崩溃转储 (Core Dump) 泄露内存解密 Token | **物理沙盒隔离 (`close_fds=True` + `RLIMIT_CORE=0`)**：全闭关句柄，POSIX 下锁定 `RLIMIT_CORE=0` 与私有 `umask(0o077)`，物理阻断泄露 |
+| **积分消耗与流速统计** | 官方无按时间窗/账号流速统计，存在“积分焦虑”且不知哪个会话耗费算力 | **极速多维计量与流速监视 (`wb-usage`)**：只读并发直连 SQLite，按今日/昨日/相对时长/全量统计积分与流速 (pts/s)；会话级下钻 (`-a`)、2s 实时流速监视 (`-w`)、`--json` 与 Zero-PII 脱敏 |
 
 ---
 
@@ -713,6 +714,16 @@ macOS 下由原生 LaunchAgent (`com.workbuddy.log-guard.plist`) 每 30 分钟�
 - **原因**：看门狗此前仅巡检沙盒私有日志（`~/.workbuddy/logs/sandbox`），对操作系统临时目录（`/tmp`、`/private/tmp`、$TMPDIR）存在巡检盲区；若使用粗暴 `rm` 删除，由于活跃进程未释放打开的文件描述符（Open FD），操作系统在进程退出前不会退还物理磁盘块，且强行删除会导致写进程异常。
 - **解决**：为 `workbuddy-log-guard` 升级落地全域临时日志应急熔断器（`clean_runaway_temp_logs`）与升级缓存回收（`clean_bundle_migration_cache`）：单文件超 500MB（可配置）执行原位清零（`truncate -s 0`），既瞬间释放物理磁盘块又保护进程不崩溃，Windows 下自动感知并跳过独占文件锁。
 
+#### 踩坑 8：会话级更新漂移、哈希伪时间戳与 WAL 并发读治理
+- **问题 1（会话更新漂移）**：多天长会话在 SQLite `session_usage` 表中仅存一个会话级 `updated_at`，若按会话时间统计，会导致历史数天的消耗全部归入当天。
+  - **根因与突破**：深入解析 `credit_json` 字段内各轮次 `requestId`，提取标准 UUIDv7 前 12 位十六进制毫秒时间戳（ADR-0001），实现轮次级（Turn-level）精准归因；无轮次时间戳时安全回退至 `updated_at`。
+- **问题 2（MD5 假时间戳误判）**：早期部分旧会话 `requestId` 为 32 位 MD5 哈希字符串，前 12 位十六进制被粗暴转换后算成公元 8000+ 年的荒谬未来时间。
+  - **根因与突破**：注入防御性物理时间范围断言（`1700000000000 <= ts <= 1900000000000`，即 2023 ~ 2030 年），超出边界直接安全回退，杜绝 MD5 污染查询时间窗。
+- **问题 3（并发读写锁死）**：WorkBuddy 客户端前台大量生成写入 WAL 时，外部进程读取易触发 SQLite `database locked`。
+  - **根因与突破**：强制采用 `file:{path}?mode=ro` (URI 模式，ADR-0003) 配合 `timeout=5.0s` 打开数据库，确保 0 锁争用瞬时读取最新 WAL 帧。
+- **问题 4（0 消耗账号呈现丢失）**：只查询有消耗记录的会话会导致 0 消耗账号在视图中“蒸发”，引发用户误判。
+  - **根因与突破**：全量遍历 `~/.workbuddy/auth_profiles` 与快照，无消耗账号稳定呈现 `0.0 pts (0%)`，保持多账号资产全景完整。
+
 ---
 
 ### 16. 🔥 生产事故深水排查与白盒物理凭证库：Seatbelt 1.7 万行规则雪崩、PTY 5s 延迟与四大“草台班子”工程缺陷
@@ -842,7 +853,7 @@ cd $HOME\.workbuddy\toolkit
 
 ## 四、命令行工具使用手册
 
-安装后，全局提供 `workbuddy` 以及 `wb-help`、`wb-login`、`wb-list`、`wb-status`、`wb-audit`、`wb-switch`、`wb-checkin`、`wb-chat`、`wb-doctor`、`wb-models`、`wb-router` 快捷命令：
+安装后，全局提供 `workbuddy` 以及 `wb-help`、`wb-usage`、`wb-login`、`wb-list`、`wb-status`、`wb-audit`、`wb-switch`、`wb-checkin`、`wb-chat`、`wb-doctor`、`wb-models`、`wb-router` 快捷命令：
 
 ### 0. 可用命令与功能清单速查 (`wb-help` / `workbuddy help`)
 
@@ -1263,11 +1274,109 @@ WorkBuddy GUI status  : RUNNING
 
 ---
 
-### 12. 常用命令速查表
+### 12. 积分消耗与流速统计 (`wb-usage` / `workbuddy usage`)
+
+深度对接 WorkBuddy 本地 SQLite 存储底座，以微秒级只读并发（`mode=ro`）瞬时捕获会话扣费账本（`credit_json`），基于标准 UUIDv7 毫秒时间戳归因（ADR-0001 / ADR-0002 / ADR-0003 / ADR-0004），提供多时间窗积分总览、活跃推理生成流速（`pts/s`）、账号消耗占比分布、单账号会话级下钻以及实时瞬时流速监视：
+
+```bash
+# 1. 默认查看今日积分消耗总览、活跃生成流速与各账号分布 (ABC 融合现代微卡片)
+wb-usage            # 或: workbuddy usage
+
+# 2. 灵活时间窗筛选：查看过去 1 小时、30 分钟、昨日或历史全量消耗
+wb-usage --since 1h # 支持 30m / 1h / 2h / 24h / 7d
+wb-usage --yesterday
+wb-usage --all
+wb-usage --from 2026-10-10 --to 2026-10-13
+
+# 3. 账号会话级明细下钻：查看指定账号名下的会话标题、单会话消耗与生成流速
+wb-usage --account Cat_1      # 支持别名或 UID 前缀 (简写: -a)
+
+# 4. 实时流速监视器：每 2 秒动态采样瞬时流速 (pts/s) 与积分增量 (优雅响应 Ctrl+C)
+wb-usage --watch              # 简写: -w
+
+# 5. AI Agent / 自动化脚本调用：输出纯净强类型 JSON 数据
+wb-usage --json               # 简写: -j
+
+# 6. 纯文本降级模式：禁用 ANSI 颜色代码并使用 ASCII 进度条 [====....] (管道重定向自动触发)
+wb-usage --plain              # 或: wb-usage | cat
+```
+
+#### 🖥️ 人类交互输出效果 (Human TTY)
+
+```text
+╭─ WorkBuddy 积分总览 [今日] ──────────────────────────────────────╮
+│  总消耗: 27.8 pts      生成流速: 0.9 pts/s     活跃会话: 1   │
+╰──────────────────────────────────────────────────────────────────╯
+
+* Cat_1       [████████████]     27.8 pts (100%)  1 会话  [0.9 pts/s]
+  dev_backup  [░░░░░░░░░░░░]      0.0 pts   (0%)  0 会话  [0.0 pts/s]
+  cat         [░░░░░░░░░░░░]      0.0 pts   (0%)  0 会话  [0.0 pts/s]
+```
+
+#### 🔍 账号会话级下钻明细 (`wb-usage -a Cat_1`)
+
+```text
+╭─ 账号会话明细: Cat_1 [今日: 27.8 pts] ───────────────────────────╮
+│  会话 ID    标题                       消耗积分    流速     更新时间  │
+├──────────────────────────────────────────────────────────────────┤
+│  68dd2739  继续 FlapPe 项目任务            27.8 pts    0.9/s   13:27:10 │
+╰──────────────────────────────────────────────────────────────────╯
+```
+
+#### 🤖 Agent 纯净结构化 Schema (`wb-usage --json`)
+
+```json
+{
+  "window": {
+    "type": "today",
+    "name": "今日",
+    "from_timestamp": 1791820800000,
+    "to_timestamp": 1791869813460,
+    "duration_seconds": 49013
+  },
+  "total_credits": 27.8,
+  "burn_rate_pts_per_sec": 0.9,
+  "window_rate_pts_per_sec": 0.0006,
+  "total_sessions": 1,
+  "active_account": "Cat_1",
+  "accounts": [
+    {
+      "alias": "Cat_1",
+      "is_active": true,
+      "uid_short": "c9485804...",
+      "credits": 27.8,
+      "ratio_pct": 100.0,
+      "session_count": 1,
+      "burn_rate_pts_per_sec": 0.9
+    },
+    {
+      "alias": "dev_backup",
+      "is_active": false,
+      "uid_short": "8b8f8495...",
+      "credits": 0.0,
+      "ratio_pct": 0.0,
+      "session_count": 0,
+      "burn_rate_pts_per_sec": 0.0
+    }
+  ]
+}
+```
+
+#### 🛡️ 核心工程与安全特性
+1. **轮次级时间戳归因 (ADR-0001)**：跨天长会话不按会话粗暴归因，而是逐请求解析 UUIDv7 毫秒时间戳；
+2. **MD5 哈希物理防御**：严格校验 `1700000000000 <= ts <= 1900000000000`，彻底阻断历史哈希被误判为公元 8000 年未来时间；
+3. **只读并发安全 (ADR-0003)**：强制以 SQLite URI 只读模式 (`mode=ro`) 打开，零锁争用、零 I/O 拷贝，前台狂写 WAL 时稳定读取；
+4. **Zero-PII 隐私脱敏**：11 位手机号自动脱敏为 `139****5678`，敏感 Token / UID 严密屏蔽；
+5. **0 消耗账号安全呈现**：未产生消耗的账号正常保留并输出 `0.0 pts (0%)`，杜绝过滤引发的资产焦虑。
+
+---
+
+### 13. 常用命令速查表
 
 | 命令 | 别名 | 功能说明 |
 | :--- | :--- | :--- |
 | `workbuddy help` | `wb-help` / `workbuddy-help` | 查看完整帮助信息与可用命令和功能列表 |
+| `workbuddy usage [选项]` | `wb-usage` | 积分消耗总览、活跃流速 (pts/s)、账号分布、会话下钻 (`-a`) 与实时监视 (`-w`) |
 | `workbuddy login [别名]` | `wb-login` | 终端 1:1 ANSI 扫码独立录入新账号，免开客户端 UI，支持冲突自愈与 `--force` |
 | `workbuddy switch [别名]` | `wb-switch` | 交互式选择或直接切换到指定账号并优雅重启 |
 | `workbuddy list [--json]` | `wb-list` | 查看当前活跃账号、到期时间及已存凭证清单（支持标准 `--json` 输出） |
