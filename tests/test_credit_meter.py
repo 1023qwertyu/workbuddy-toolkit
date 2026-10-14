@@ -698,6 +698,72 @@ class TestCreditMeterEngine(unittest.TestCase):
         self.assertIsNotNone(alice_iv)
         self.assertEqual(alice_iv[1], t_bob_init * 1000)
 
+    def test_13_zero_profiles_conservation_and_unattributed_bucket(self):
+        """测试零 Profile（冷启动/未录入任何账号）边界下，积分绝不静默丢失，全额归属至 (未归属) 且严格守恒"""
+        tz = timezone(timedelta(hours=8))
+        now_dt = datetime(2026, 10, 14, 12, 0, 0, tzinfo=tz)
+        turn_ts = int(datetime(2026, 10, 14, 10, 0, 0, tzinfo=tz).timestamp() * 1000)
+        valid_hex = f"{turn_ts:012x}"
+
+        # 确保 profiles 目录为空，且没有活跃 info
+        empty_prof_dir = os.path.join(self.test_dir, "empty_profiles")
+        os.makedirs(empty_prof_dir, exist_ok=True)
+        no_active_info = os.path.join(self.test_dir, "non_existent_active.info")
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO sessions (id, cwd, user_id, title, updated_at) VALUES (?, ?, '', ?, ?)",
+                    ("sess-unattr", "/tmp", "无账号孤儿任务", turn_ts))
+        cur.execute("INSERT INTO session_usage VALUES (?, 10, 10, ?, ?)",
+                    ("sess-unattr", turn_ts, json.dumps({f"{valid_hex}-7000-8000-000000000001": 77.5})))
+        conn.commit()
+        conn.close()
+
+        meter = CreditMeter(
+            db_path=self.db_path,
+            profiles_dir=empty_prof_dir,
+            active_info_path=no_active_info,
+            workbuddy_dir=self.test_dir,
+        )
+
+        window = meter.parse_time_window(all_time=True, now_dt=now_dt)
+        data = meter.query_usage(window)
+
+        # 核心断言 1: 总消耗必须是 77.5 pts
+        self.assertEqual(data["total_credits"], 77.5)
+
+        # 核心断言 2: 积分不能被丢弃，必须准确捕获到 (未归属) 桶
+        self.assertEqual(len(data["accounts"]), 1)
+        unattr_acc = data["accounts"][0]
+        self.assertEqual(unattr_acc["alias"], "(未归属)")
+        self.assertEqual(unattr_acc["credits"], 77.5)
+
+        # 核心断言 3: 守恒严格成立
+        acc_sum = sum(a["credits"] for a in data["accounts"])
+        self.assertAlmostEqual(acc_sum, data["total_credits"], places=1)
+
+    def test_14_drilldown_error_sanitization_and_readonly_pragma(self):
+        """测试异常消息中手机号 PII 强制脱敏与 SQLite 连接只读保证"""
+        tz = timezone(timedelta(hours=8))
+        now_dt = datetime(2026, 10, 14, 12, 0, 0, tzinfo=tz)
+        window = self.meter.parse_time_window(all_time=True, now_dt=now_dt)
+
+        raw_phone = "13912345678"
+        try:
+            self.meter.query_account_drilldown(raw_phone, window)
+            self.fail("应当抛出 ValueError")
+        except ValueError as e:
+            err_msg = str(e)
+            # 必须包含脱敏后的手机号
+            self.assertIn("139****5678", err_msg)
+            # 严禁泄露原始未脱敏手机号
+            self.assertNotIn(raw_phone, err_msg)
+
+        # 验证只读连接
+        conn = self.meter._get_readonly_conn()
+        self.assertIsNotNone(conn)
+        conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

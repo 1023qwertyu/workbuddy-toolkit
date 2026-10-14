@@ -108,7 +108,12 @@ class CreditMeter:
             return sqlite3.connect(file_url, uri=True, timeout=5.0)
         except Exception:
             try:
-                return sqlite3.connect(self.db_path, timeout=5.0)
+                conn = sqlite3.connect(self.db_path, timeout=5.0)
+                try:
+                    conn.execute("PRAGMA query_only = ON;")
+                except Exception:
+                    pass
+                return conn
             except Exception:
                 return None
 
@@ -292,6 +297,13 @@ class CreditMeter:
         if sid in self._session_turn_cache:
             return self._session_turn_cache[sid]
 
+        # Bound cache size to prevent memory leaks during long-running --watch sessions
+        MAX_CACHE_SIZE = 500
+        if len(self._session_turn_cache) >= MAX_CACHE_SIZE:
+            keys = list(self._session_turn_cache.keys())
+            for k in keys[:MAX_CACHE_SIZE // 2]:
+                del self._session_turn_cache[k]
+
         turn_map: Dict[str, int] = {}
         jsonl_path = self._find_session_jsonl(sid)
         if jsonl_path and os.path.isfile(jsonl_path):
@@ -324,17 +336,12 @@ class CreditMeter:
         3. Fallback timestamp (session created_at / updated_at)
         """
         if isinstance(req_id, str):
-            clean_id = req_id.replace("-", "").strip().lower()
-            if len(clean_id) >= 12:
-                try:
-                    candidate = int(clean_id[:12], 16)
-                    if 1700000000000 <= candidate <= 1900000000000:
-                        if len(clean_id) < 13 or clean_id[12] == "7":
-                            return candidate
-                except Exception:
-                    pass
+            uuidv7_ts = self.extract_turn_timestamp(req_id, 0)
+            if uuidv7_ts != 0:
+                return uuidv7_ts
 
             if sid:
+                clean_id = req_id.replace("-", "").strip().lower()
                 turn_map = self._get_session_turn_map(sid)
                 if req_id in turn_map:
                     return turn_map[req_id]
@@ -670,10 +677,20 @@ class CreditMeter:
                                     acc_sessions[owner_uid].add(sid)
                                 else:
                                     target_u = active_uid if (active_uid and active_uid in acc_credits) else default_uid
-                                    if target_u in acc_credits:
+                                    if target_u and target_u in acc_credits:
                                         acc_credits[target_u] += pts_float
                                         acc_turns[target_u] += 1
                                         acc_sessions[target_u].add(sid)
+                                    else:
+                                        # Conservation enforcement: ensure credits are never dropped even if zero profiles exist
+                                        _unattr = "__unattributed__"
+                                        if _unattr not in acc_credits:
+                                            acc_credits[_unattr] = 0.0
+                                            acc_turns[_unattr] = 0
+                                            acc_sessions[_unattr] = set()
+                                        acc_credits[_unattr] += pts_float
+                                        acc_turns[_unattr] += 1
+                                        acc_sessions[_unattr].add(sid)
                     except Exception:
                         pass
             except Exception:
@@ -707,6 +724,23 @@ class CreditMeter:
                 "ratio_pct": 0.0,
                 "session_count": len(active_sids),
                 "burn_rate_pts_per_sec": burn_rate,
+            })
+
+        # Conservation enforcement: append unattributed bucket if nonzero credits exist
+        if "__unattributed__" in acc_credits and acc_credits["__unattributed__"] > 0:
+            unattr_creds = float(round(acc_credits["__unattributed__"], 1))
+            unattr_turns = acc_turns.get("__unattributed__", 0)
+            unattr_sids = acc_sessions.get("__unattributed__", set())
+            unattr_sec = max(unattr_turns * 10.0, 1.0)
+            unattr_rate = round(unattr_creds / unattr_sec, 1) if unattr_creds > 0 else 0.0
+            account_rows.append({
+                "alias": "(未归属)",
+                "is_active": False,
+                "uid_short": "n/a",
+                "credits": unattr_creds,
+                "ratio_pct": 0.0,
+                "session_count": len(unattr_sids),
+                "burn_rate_pts_per_sec": unattr_rate,
             })
 
         # Calculate ratios against total rounded credits
@@ -757,7 +791,7 @@ class CreditMeter:
                     break
 
         if not matched_prof:
-            raise ValueError(f"未找到匹配的账号 Profile: '{target}'。可通过 'wb-list' 查看已保存账号。")
+            raise ValueError(f"未找到匹配的账号 Profile: '{sanitize_alias(target)}'。可通过 'wb-list' 查看已保存账号。")
 
         uid = matched_prof["uid"]
         sids = set(self.load_account_sessions(uid))
