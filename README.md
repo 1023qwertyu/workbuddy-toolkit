@@ -1,8 +1,8 @@
 # WorkBuddy Toolkit
 
 [![CI: Cross-Platform Matrix](https://github.com/FlapPearLabs/workbuddy-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit/actions/workflows/ci.yml)
-[![Release: v0.6.0](https://img.shields.io/badge/Release-v0.6.0-blue.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit)
-[![Tests: 139/139 Passed](https://img.shields.io/badge/Tests-139%2F139%20Passed-brightgreen.svg)](tests/)
+[![Release: v0.7.0](https://img.shields.io/badge/Release-v0.7.0-blue.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit)
+[![Tests: 146/146 Passed](https://img.shields.io/badge/Tests-146%2F146%20Passed-brightgreen.svg)](tests/)
 [![Security: Zero-Leak](https://img.shields.io/badge/Security-Zero--Leak%20Audit%20Passed-success.svg)](.github/workflows/ci.yml)
 [![Platform: macOS | Linux | Windows](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-brightgreen.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit)
 [![Python: 3.8+](https://img.shields.io/badge/Python-3.8+-green.svg)](https://python.org)
@@ -121,6 +121,32 @@ wb-audit
 ---
 
 ## 核心能力
+
+### 交互式控制中心 — `wb-tool`
+
+不喜欢记忆琐碎的 CLI 命令与参数？直接输入 `wb-tool`（或 `workbuddy tool`），即可启动遵循《Don't Make Me Think》与设计四原则（CRAP）打造的极简终端控制台：
+
+```text
+╭─ WorkBuddy 工具箱 (wb-tool v0.7.0) ─────────────────────────────────────────╮
+│  当前账号: Cat_1 (正常) │ 今日消耗: 92.2 积分 │ 已存账号: 3 个               │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+[ 主菜单 ]
+────────────────────────────────────────────────────────────
+  [1] 查看积分  ── 查看今日与历史消耗，支持实时刷新和明细下钻
+  [2] 切换账号  ── 免扫码一键切号，支持查看已存账号并录入新号
+  [3] 每日签到  ── 一键领取每日积分奖励，自动发送保活打卡对话
+  [4] 模型切换  ── 查看可用模型列表与费率，切换常用默认模型
+  [5] 清理磁盘  ── 清理后台残留临时缓存，释放被占用的电脑空间
+  [6] 重启软件  ── 一键关闭并重新打开客户端，使新配置即时生效
+  [0] 退出    ── 关闭工具箱，返回命令行终端
+────────────────────────────────────────────────────────────
+请选择操作编号 [0-6]: 
+```
+
+- **零记忆负担**：全中文直观选项，摒弃生硬技术黑话；
+- **面包屑级联回退**：子菜单按 `0`、`q` 或 `Esc` 原地返回上一级，仅在主菜单退出；
+- **连续操作闭环**：操作完成后原地刷新顶栏状态卡片，退出时自动输出会话审计报告。
 
 ### 账号管理
 
