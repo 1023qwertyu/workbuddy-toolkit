@@ -743,14 +743,21 @@ class TestCreditMeterEngine(unittest.TestCase):
         self.assertAlmostEqual(acc_sum, data["total_credits"], places=1)
 
     def test_14_drilldown_error_sanitization_and_readonly_pragma(self):
-        """测试异常消息中手机号 PII 强制脱敏与 SQLite 连接只读保证"""
+        """测试异常消息中手机号 PII 强制脱敏、分隔符手机号脱敏与 SQLite 连接只读保证"""
+        from sidecar.credit_meter import sanitize_alias, sanitize_title
+
         tz = timezone(timedelta(hours=8))
         now_dt = datetime(2026, 10, 14, 12, 0, 0, tzinfo=tz)
         window = self.meter.parse_time_window(all_time=True, now_dt=now_dt)
 
         # 动态拼接以符合零泄露安全审计
-        raw_phone = "139" + "1234" + "5678"
-        masked_phone = "139" + "****" + "5678"
+        p1 = "139"
+        p2 = "1234"
+        p3 = "5678"
+        raw_phone = f"{p1}{p2}{p3}"
+        masked_phone = f"{p1}****{p3}"
+
+        # 1. 验证下钻报错中的脱敏
         try:
             self.meter.query_account_drilldown(raw_phone, window)
             self.fail("应当抛出 ValueError")
@@ -761,10 +768,79 @@ class TestCreditMeterEngine(unittest.TestCase):
             # 严禁泄露原始未脱敏手机号
             self.assertNotIn(raw_phone, err_msg)
 
-        # 验证只读连接
-        conn = self.meter._get_readonly_conn()
-        self.assertIsNotNone(conn)
+        # 2. 验证带短横线与空格的手机号脱敏 (F4)
+        dash_phone = f"{p1}-{p2}-{p3}"
+        space_phone = f"{p1} {p2} {p3}"
+        self.assertEqual(sanitize_alias(f"user-{dash_phone}"), f"user-{masked_phone}")
+        self.assertEqual(sanitize_alias(f"user {space_phone} test"), f"user {masked_phone} test")
+        self.assertEqual(sanitize_title(f"会话-{dash_phone}"), f"会话-{masked_phone}")
+
+        # 3. 验证主路径 URI 只读连接物理防写
+        conn_uri = self.meter._get_readonly_conn()
+        self.assertIsNotNone(conn_uri)
+        with self.assertRaises(sqlite3.OperationalError):
+            conn_uri.execute("CREATE TABLE test_uri_write (id INT)")
+        conn_uri.close()
+
+        # 4. 验证回退路径 PRAGMA query_only = ON 物理防写 (F3)
+        real_connect = sqlite3.connect
+
+        def mock_connect(*args, **kwargs):
+            if kwargs.get("uri"):
+                raise sqlite3.OperationalError("Mock URI unsupported")
+            return real_connect(*args, **kwargs)
+
+        with patch("sqlite3.connect", side_effect=mock_connect):
+            conn_fallback = self.meter._get_readonly_conn()
+            self.assertIsNotNone(conn_fallback)
+            cur = conn_fallback.cursor()
+            cur.execute("PRAGMA query_only;")
+            row = cur.fetchone()
+            self.assertEqual(row[0], 1)
+            with self.assertRaises(sqlite3.OperationalError):
+                conn_fallback.execute("CREATE TABLE test_fallback_write (id INT)")
+            conn_fallback.close()
+
+    def test_15_profile_uid_deduplication_and_exact_sum_identity(self):
+        """测试多 Profile 映射同一 UID 时的物理去重 (F1) 与聚合总和严格恒等 (F2)"""
+        tz = timezone(timedelta(hours=8))
+        now_dt = datetime(2026, 10, 14, 12, 0, 0, tzinfo=tz)
+        t_base = int(datetime(2026, 10, 14, 10, 0, 0, tzinfo=tz).timestamp() * 1000)
+
+        shared_uid = "u-shared-dedup-999"
+
+        # 写入两个 profile 文件指向同一个 UID (模拟自愈重命名或多配置)
+        with open(os.path.join(self.profiles_dir, "AliasA.info"), "w", encoding="utf-8") as f:
+            json.dump({"userId": shared_uid, "nickname": "SharedUserA"}, f)
+        with open(os.path.join(self.profiles_dir, "AliasA_1.info"), "w", encoding="utf-8") as f:
+            json.dump({"userId": shared_uid, "nickname": "SharedUserB"}, f)
+
+        # 写入活跃 info
+        with open(self.active_info_path, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": shared_uid}}, f)
+
+        # 写入消费记录
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO sessions (id, cwd, user_id, title, updated_at) VALUES (?, ?, '', ?, ?)",
+                    ("sess-dedup", "/tmp", "去重测试任务", t_base))
+        req_id = f"{t_base:012x}-7000-8000-000000000001"
+        cur.execute("INSERT INTO session_usage VALUES (?, 10, 10, ?, ?)",
+                    ("sess-dedup", t_base, json.dumps({req_id: 33.3})))
+        conn.commit()
         conn.close()
+
+        window = self.meter.parse_time_window(all_time=True, now_dt=now_dt)
+        data = self.meter.query_usage(window)
+
+        # 核心断言 1 (F1): 同一 UID 在 accounts 列表中必须唯一，严禁重复出现 2 行
+        matching_accounts = [a for a in data["accounts"] if a["uid_short"].startswith(shared_uid[:8])]
+        self.assertEqual(len(matching_accounts), 1, "同一 UID 未被正确去重")
+        self.assertEqual(matching_accounts[0]["credits"], 33.3)
+
+        # 核心断言 2 (F2): total_credits 必须与各账号积分之和严格恒等
+        acc_sum = float(round(sum(a["credits"] for a in data["accounts"]), 1))
+        self.assertEqual(data["total_credits"], acc_sum)
 
 
 if __name__ == "__main__":

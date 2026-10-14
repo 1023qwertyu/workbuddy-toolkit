@@ -37,17 +37,27 @@ RESET = "\033[0m"
 
 
 def sanitize_alias(alias: str) -> str:
-    """Masks 11-digit mobile phone numbers for Zero-PII compliance."""
+    """Masks 11-digit mobile phone numbers (including space/dash separated) for Zero-PII compliance."""
     if not alias:
         return alias
-    return re.sub(r"1[3-9]\d{9}", lambda m: f"{m.group()[:3]}****{m.group()[7:]}", alias)
+    def _mask(m):
+        digits = re.sub(r"\D", "", m.group())
+        if len(digits) == 11 and digits.startswith(("13", "14", "15", "16", "17", "18", "19")):
+            return f"{digits[:3]}****{digits[7:]}"
+        return m.group()
+    return re.sub(r"(?<!\d)1[3-9][\d\s\-]{8,11}\d(?!\d)", _mask, alias)
 
 
 def sanitize_title(title: str) -> str:
     """Masks 11-digit mobile phone numbers in session titles."""
     if not title:
         return "未命名会话"
-    return re.sub(r"1[3-9]\d{9}", lambda m: f"{m.group()[:3]}****{m.group()[7:]}", title)
+    def _mask(m):
+        digits = re.sub(r"\D", "", m.group())
+        if len(digits) == 11 and digits.startswith(("13", "14", "15", "16", "17", "18", "19")):
+            return f"{digits[:3]}****{digits[7:]}"
+        return m.group()
+    return re.sub(r"(?<!\d)1[3-9][\d\s\-]{8,11}\d(?!\d)", _mask, title)
 
 
 class CreditMeter:
@@ -703,7 +713,15 @@ class CreditMeter:
         account_rows = []
         active_account_name = None
 
+        # Deduplicate profiles by UID to guarantee each physical account appears exactly once
+        unique_profiles: Dict[str, Dict[str, Any]] = {}
         for alias, prof in profiles.items():
+            uid = prof["uid"]
+            if uid not in unique_profiles or prof.get("is_active"):
+                unique_profiles[uid] = prof
+
+        for prof in unique_profiles.values():
+            alias = prof["alias"]
             uid = prof["uid"]
             is_active = prof["is_active"]
             if is_active:
@@ -742,6 +760,9 @@ class CreditMeter:
                 "session_count": len(unattr_sids),
                 "burn_rate_pts_per_sec": unattr_rate,
             })
+
+        # Strict conservation identity: total_credits is exactly equal to the sum of account rows
+        total_credits = float(round(sum(acc["credits"] for acc in account_rows), 1))
 
         # Calculate ratios against total rounded credits
         for acc in account_rows:
