@@ -490,6 +490,109 @@ class TestCreditMeterEngine(unittest.TestCase):
             workbuddy.PROFILES_DIR = orig_profiles
             workbuddy.AUTH_FILE = orig_auth
 
+    def test_10_multi_account_shared_sessions_and_timeline_attribution(self):
+        """测试多账号共享工作区下的唯一积分归集与时间线精确归因（防双重计费与防快照缺失漏账）"""
+        now_dt = datetime(2026, 10, 14, 12, 0, 0)
+        t_base = int(datetime(2026, 10, 14, 8, 0, 0).timestamp() * 1000)
+
+        # 1. 模拟三个账号: Alice (当前活跃), Bob (中间活跃), Charlie (早期活跃，无快照目录)
+        alice_uid = "u-alice-1111"
+        bob_uid = "u-bob-2222"
+        charlie_uid = "u-charlie-3333"
+
+        with open(self.active_info_path, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": alice_uid}}, f)
+
+        for alias, uid in [("Alice", alice_uid), ("Bob", bob_uid), ("Charlie", charlie_uid)]:
+            with open(os.path.join(self.profiles_dir, f"{alias}.info"), "w", encoding="utf-8") as f:
+                json.dump({"userId": uid, "nickname": alias}, f)
+
+        # 2. 模拟侧边栏快照: Alice 和 Bob 重叠包含 sess-shared (100 pts)
+        alice_snap = os.path.join(self.test_dir, alice_uid)
+        os.makedirs(alice_snap, exist_ok=True)
+        with open(os.path.join(alice_snap, "sidebar-list-snapshot.json"), "w", encoding="utf-8") as f:
+            json.dump({"items": [{"id": "sess-shared"}, {"id": "sess-alice"}]}, f)
+
+        bob_snap = os.path.join(self.test_dir, bob_uid)
+        os.makedirs(bob_snap, exist_ok=True)
+        with open(os.path.join(bob_snap, "sidebar-list-snapshot.json"), "w", encoding="utf-8") as f:
+            json.dump({"items": [{"id": "sess-shared"}, {"id": "sess-bob"}]}, f)
+
+        # Charlie 故意没有 snapshot 目录（模拟通过 CLI/免登录入的账号）
+
+        # 3. 模拟 AppStartup.log 时间线
+        # Charlie 活跃在 8:00 ~ 9:00
+        # Bob 活跃在 9:00 ~ 10:00
+        # Alice 活跃在 10:00 ~ 12:00
+        logs_dir = os.path.join(self.test_dir, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        log_file = os.path.join(logs_dir, "AppStartup.log")
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write(f"2026-10-14T08:00:00.000+08:00 [AppStartup] userId={charlie_uid}\n")
+            f.write(f"2026-10-14T09:00:00.000+08:00 [AppStartup] userId={bob_uid}\n")
+            f.write(f"2026-10-14T10:00:00.000+08:00 [AppStartup] userId={alice_uid}\n")
+
+        # 4. 写入 SQLite 数据：生产环境因为触发器 sessions.user_id 全部为空字符串 ""
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        for sid, title in [
+            ("sess-shared", "共享项目会话"),
+            ("sess-alice", "Alice专属任务"),
+            ("sess-bob", "Bob专属任务"),
+            ("sess-charlie", "Charlie专属任务"),
+        ]:
+            cur.execute("INSERT INTO sessions (id, cwd, user_id, title, updated_at) VALUES (?, ?, '', ?, ?)",
+                        (sid, "/tmp", title, t_base))
+
+        def make_req(ts):
+            return f"{ts:012x}-7000-8000-000000000001"
+
+        # Charlie: 8:30 产生 40.0 pts (sess-charlie)
+        ts_charlie = t_base + 30 * 60 * 1000
+        cur.execute("INSERT INTO session_usage VALUES (?, 10, 10, ?, ?)",
+                    ("sess-charlie", ts_charlie, json.dumps({make_req(ts_charlie): 40.0})))
+
+        # Bob: 9:30 产生 30.0 pts (sess-bob)
+        ts_bob = t_base + 90 * 60 * 1000
+        cur.execute("INSERT INTO session_usage VALUES (?, 10, 10, ?, ?)",
+                    ("sess-bob", ts_bob, json.dumps({make_req(ts_bob): 30.0})))
+
+        # Alice: 10:15 产生 100.0 pts (sess-shared)
+        ts_shared = t_base + 135 * 60 * 1000
+        cur.execute("INSERT INTO session_usage VALUES (?, 10, 10, ?, ?)",
+                    ("sess-shared", ts_shared, json.dumps({make_req(ts_shared): 100.0})))
+
+        # Alice: 10:45 产生 50.0 pts (sess-alice)
+        ts_alice = t_base + 165 * 60 * 1000
+        cur.execute("INSERT INTO session_usage VALUES (?, 10, 10, ?, ?)",
+                    ("sess-alice", ts_alice, json.dumps({make_req(ts_alice): 50.0})))
+
+        conn.commit()
+        conn.close()
+
+        # 5. 执行全量查询
+        window = self.meter.parse_time_window(all_time=True, now_dt=now_dt)
+        data = self.meter.query_usage(window)
+
+        # 核心断言 1: 总消耗必须是全局唯一真实积分 40 + 30 + 100 + 50 = 220.0 pts，绝对不可双重计费虚增为 320.0 pts！
+        self.assertEqual(data["total_credits"], 220.0, f"总消耗存在重复统计: {data['total_credits']} != 220.0")
+
+        # 核心断言 2: 无 snapshot 目录的 Charlie 绝对不可被吞掉变 0 pts！
+        charlie_acc = next((a for a in data["accounts"] if a["alias"] == "Charlie"), None)
+        self.assertIsNotNone(charlie_acc)
+        self.assertEqual(charlie_acc["credits"], 40.0, f"Charlie 积分丢失: {charlie_acc['credits']} != 40.0")
+
+        # 核心断言 3: 各账号积分之和必须严格等于总消耗 (零损耗守恒)
+        acc_sum = sum(a["credits"] for a in data["accounts"])
+        self.assertAlmostEqual(acc_sum, data["total_credits"], places=1)
+
+        # 核心断言 4: 下钻查询 Charlie 必须准确呈现 1 个会话与 40.0 pts
+        drill_charlie = self.meter.query_account_drilldown("Charlie", window)
+        self.assertEqual(drill_charlie["total_credits"], 40.0)
+        self.assertEqual(len(drill_charlie["sessions"]), 1)
+        self.assertEqual(drill_charlie["sessions"][0]["title"], "Charlie专属任务")
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -25,7 +25,7 @@ import sqlite3
 import argparse
 import urllib.request
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 # ANSI terminal colors (strictly disabled in non-TTY or plain mode)
 BOLD = "\033[1m"
@@ -332,6 +332,123 @@ class CreditMeter:
 
         return profiles
 
+    def build_account_timeline(self) -> List[Tuple[int, int, str]]:
+        """Constructs chronological account active intervals [(start_ms, end_ms, uid), ...].
+        
+        Sources:
+        1. AppStartup.log in workbuddy_dir/logs/AppStartup.log
+        2. Storage directory creation/mtimes for pre-log account inference
+        """
+        log_path = os.path.join(self.workbuddy_dir, "logs", "AppStartup.log")
+        intervals: List[Tuple[int, int, str]] = []
+        if os.path.exists(log_path):
+            raw_events: List[Tuple[int, str]] = []
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        m_time = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?[+-]\d{2}:\d{2})", line)
+                        if not m_time:
+                            continue
+                        try:
+                            dt = datetime.fromisoformat(m_time.group(1))
+                            ts = int(dt.timestamp() * 1000)
+                        except Exception:
+                            continue
+                        m_user = re.search(r"userId=([a-zA-Z0-9_\-]+)", line)
+                        if m_user and m_user.group(1).lower() != "unknown":
+                            raw_events.append((ts, m_user.group(1).rstrip("-")))
+            except Exception:
+                pass
+
+            curr_uid = None
+            start_ts = 0
+            for ts, uid in raw_events:
+                if uid != curr_uid:
+                    if curr_uid is not None:
+                        intervals.append((start_ts, ts, curr_uid))
+                    curr_uid = uid
+                    start_ts = ts
+            if curr_uid is not None:
+                intervals.append((start_ts, 9999999999999, curr_uid))
+
+            if intervals:
+                # Infer earliest UID before the log started from storage directory creation/mtimes
+                storage_users = []
+                for p in glob.glob(os.path.join(self.workbuddy_dir, "storage", "user-*")):
+                    m = re.search(r"user-([0-9a-f\-]+)", os.path.basename(p))
+                    if m:
+                        clean_u = m.group(1).rstrip("-")
+                        try:
+                            storage_users.append((os.path.getmtime(p), clean_u))
+                        except Exception:
+                            pass
+                if storage_users:
+                    storage_users.sort()
+                    earliest_uid = storage_users[0][1]
+                else:
+                    earliest_uid = intervals[0][2]
+
+                first_start = intervals[0][0]
+                if first_start > 0:
+                    intervals.insert(0, (0, first_start, earliest_uid))
+
+        return intervals
+
+    def build_session_owner_map(self, profiles: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+        """Builds fallback session -> owner_uid mapping for sessions when timeline is absent or ambiguous."""
+        session_owner: Dict[str, str] = {}
+        conn = self._get_readonly_conn()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT id, user_id FROM sessions WHERE user_id != '' AND user_id IS NOT NULL")
+                for sid, uid in cur.fetchall():
+                    if sid and uid:
+                        session_owner[str(sid)] = str(uid)
+            except Exception:
+                pass
+            finally:
+                conn.close()
+
+        snapshot_counts: Dict[str, List[str]] = {}
+        for alias, prof in profiles.items():
+            uid = prof["uid"]
+            snap_path = os.path.join(self.workbuddy_dir, uid, "sidebar-list-snapshot.json")
+            if os.path.exists(snap_path):
+                try:
+                    with open(snap_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        for item in data.get("items", []):
+                            if isinstance(item, dict) and "id" in item:
+                                sid = str(item["id"])
+                                snapshot_counts.setdefault(sid, []).append(uid)
+                except Exception:
+                    pass
+
+        for sid, uids in snapshot_counts.items():
+            if sid not in session_owner:
+                session_owner[sid] = uids[0]
+
+        return session_owner
+
+    def resolve_turn_owner(
+        self,
+        ts: int,
+        sid: str,
+        timeline: List[Tuple[int, int, str]],
+        session_owner_map: Dict[str, str],
+        active_uid: Optional[str],
+        default_uid: str,
+    ) -> str:
+        """Determines the owner account UID for a specific generation turn."""
+        if timeline:
+            for s, e, uid in timeline:
+                if s <= ts < e:
+                    return uid
+        if sid in session_owner_map:
+            return session_owner_map[sid]
+        return active_uid or default_uid
+
     def load_account_sessions(self, uid: str) -> List[str]:
         """Resolves session IDs associated with a specific user UID."""
         sids = []
@@ -360,19 +477,64 @@ class CreditMeter:
             finally:
                 conn.close()
 
+        # Timeline-attributed sessions: if timeline attributes turns to this UID, include those sessions
+        timeline = self.build_account_timeline()
+        if timeline:
+            user_intervals = [iv for iv in timeline if iv[2] == uid]
+            if user_intervals:
+                conn2 = self._get_readonly_conn()
+                if conn2:
+                    try:
+                        cur2 = conn2.cursor()
+                        cur2.execute("SELECT session_id, updated_at, credit_json FROM session_usage")
+                        for s_id, upd, cj_str in cur2.fetchall():
+                            if not s_id or not cj_str or s_id in sids:
+                                continue
+                            try:
+                                cj = json.loads(cj_str)
+                                for req_id in cj:
+                                    t_ts = self.extract_turn_timestamp(req_id, upd or 0)
+                                    for s, e, _ in user_intervals:
+                                        if s <= t_ts < e:
+                                            sids.append(s_id)
+                                            break
+                                    if s_id in sids:
+                                        break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    finally:
+                        conn2.close()
+
         return sids
 
     def query_usage(self, window: Dict[str, Any]) -> Dict[str, Any]:
-        """Core metering computation across all accounts within the time window."""
+        """Core metering computation across all accounts within the time window.
+        
+        Guarantees:
+        1. Mathematical Invariant: total_credits is the unique sum of valid turn points (Zero Double-Counting).
+        2. Account Attribution: turns are attributed via chronological timeline or session ownership.
+        3. 0-Consumption Preservation: all configured profiles appear in output.
+        """
         profiles = self.load_profiles()
         conn = self._get_readonly_conn()
 
-        session_credits: Dict[str, float] = {}
-        session_turns: Dict[str, int] = {}
-        session_last_ts: Dict[str, int] = {}
+        timeline = self.build_account_timeline()
+        session_owner_map = self.build_session_owner_map(profiles)
+        active_uid = self.load_active_uid()
+        default_uid = active_uid or (list(profiles.values())[0]["uid"] if profiles else "")
 
         from_ts = window["from_timestamp"]
         to_ts = window["to_timestamp"]
+
+        session_credits: Dict[str, float] = {}
+        acc_credits: Dict[str, float] = {prof["uid"]: 0.0 for prof in profiles.values()}
+        acc_turns: Dict[str, int] = {prof["uid"]: 0 for prof in profiles.values()}
+        acc_sessions: Dict[str, set] = {prof["uid"]: set() for prof in profiles.values()}
+        all_active_sids = set()
+        total_unique_credits = 0.0
+        total_active_turns = 0
 
         if conn:
             try:
@@ -392,9 +554,23 @@ class CreditMeter:
                                 continue
                             ts = self.extract_turn_timestamp(req_id, updated_at or 0)
                             if from_ts <= ts <= to_ts:
-                                session_credits[sid] = session_credits.get(sid, 0.0) + float(pts)
-                                session_turns[sid] = session_turns.get(sid, 0) + 1
-                                session_last_ts[sid] = max(session_last_ts.get(sid, 0), ts)
+                                pts_float = float(pts)
+                                total_unique_credits += pts_float
+                                total_active_turns += 1
+                                session_credits[sid] = session_credits.get(sid, 0.0) + pts_float
+                                all_active_sids.add(sid)
+
+                                owner_uid = self.resolve_turn_owner(ts, sid, timeline, session_owner_map, active_uid, default_uid)
+                                if owner_uid in acc_credits:
+                                    acc_credits[owner_uid] += pts_float
+                                    acc_turns[owner_uid] += 1
+                                    acc_sessions[owner_uid].add(sid)
+                                else:
+                                    target_u = active_uid if (active_uid and active_uid in acc_credits) else default_uid
+                                    if target_u in acc_credits:
+                                        acc_credits[target_u] += pts_float
+                                        acc_turns[target_u] += 1
+                                        acc_sessions[target_u].add(sid)
                     except Exception:
                         pass
             except Exception:
@@ -402,10 +578,9 @@ class CreditMeter:
             finally:
                 conn.close()
 
-        # Attribute sessions to accounts
+        total_credits = float(round(total_unique_credits, 1))
+
         account_rows = []
-        total_credits = 0.0
-        total_active_turns = 0
         active_account_name = None
 
         for alias, prof in profiles.items():
@@ -414,30 +589,22 @@ class CreditMeter:
             if is_active:
                 active_account_name = alias
 
-            sids = self.load_account_sessions(uid)
-            acc_creds = sum(session_credits.get(s, 0.0) for s in sids)
-            active_sids = [s for s in sids if session_credits.get(s, 0.0) > 0]
-            acc_turns = sum(session_turns.get(s, 0) for s in sids)
+            acc_creds = float(round(acc_credits.get(uid, 0.0), 1))
+            turns = acc_turns.get(uid, 0)
+            active_sids = acc_sessions.get(uid, set())
 
-            # Active generation burn rate (pts/s) during active turns
-            active_seconds = max(acc_turns * 10.0, 1.0)
+            active_seconds = max(turns * 10.0, 1.0)
             burn_rate = round(acc_creds / active_seconds, 1) if acc_creds > 0 else 0.0
-
-            acc_creds_rounded = float(round(acc_creds, 1))
-            total_credits += acc_creds_rounded
-            total_active_turns += acc_turns
 
             account_rows.append({
                 "alias": sanitize_alias(alias),
                 "is_active": is_active,
                 "uid_short": prof["uid_short"],
-                "credits": acc_creds_rounded,
+                "credits": acc_creds,
                 "ratio_pct": 0.0,
                 "session_count": len(active_sids),
                 "burn_rate_pts_per_sec": burn_rate,
             })
-
-        total_credits = float(round(total_credits, 1))
 
         # Calculate ratios against total rounded credits
         for acc in account_rows:
@@ -448,21 +615,17 @@ class CreditMeter:
         account_rows.sort(key=lambda x: (not x["is_active"], -x["credits"], x["alias"]))
 
         # Window-level burn rates
-        total_credits = round(total_credits, 1)
         total_active_sec = max(total_active_turns * 10.0, 1.0)
         overall_burn_rate = round(total_credits / total_active_sec, 1) if total_credits > 0 else 0.0
         window_sec = max(window["duration_seconds"], 1)
         window_rate = round(total_credits / window_sec, 4) if total_credits > 0 else 0.0
-
-        # Unique active sessions across all accounts
-        total_sessions = sum(a["session_count"] for a in account_rows)
 
         return {
             "window": window,
             "total_credits": total_credits,
             "burn_rate_pts_per_sec": overall_burn_rate,
             "window_rate_pts_per_sec": window_rate,
-            "total_sessions": total_sessions,
+            "total_sessions": len(all_active_sids),
             "active_account": sanitize_alias(active_account_name) if active_account_name else None,
             "accounts": account_rows,
         }
@@ -484,7 +647,6 @@ class CreditMeter:
                 break
 
         if not matched_prof:
-            # Check if any profile alias when sanitized matches
             for alias, prof in profiles.items():
                 if sanitize_alias(alias).lower() == target_clean:
                     matched_alias = alias
@@ -495,7 +657,12 @@ class CreditMeter:
             raise ValueError(f"未找到匹配的账号 Profile: '{target}'。可通过 'wb-list' 查看已保存账号。")
 
         uid = matched_prof["uid"]
-        sids = self.load_account_sessions(uid)
+        sids = set(self.load_account_sessions(uid))
+
+        timeline = self.build_account_timeline()
+        session_owner_map = self.build_session_owner_map(profiles)
+        active_uid = self.load_active_uid()
+        default_uid = active_uid or (list(profiles.values())[0]["uid"] if profiles else "")
 
         from_ts = window["from_timestamp"]
         to_ts = window["to_timestamp"]
@@ -513,7 +680,7 @@ class CreditMeter:
                 cur = conn.cursor()
                 cur.execute("SELECT session_id, updated_at, credit_json FROM session_usage")
                 for sid, updated_at, credit_json in cur.fetchall():
-                    if sid not in sids or not credit_json:
+                    if not sid or not credit_json:
                         continue
                     try:
                         cj = json.loads(credit_json)
@@ -526,17 +693,22 @@ class CreditMeter:
                                 continue
                             ts = self.extract_turn_timestamp(req_id, updated_at or 0)
                             if from_ts <= ts <= to_ts:
-                                session_credits[sid] = session_credits.get(sid, 0.0) + float(pts)
-                                session_turns[sid] = session_turns.get(sid, 0) + 1
-                                session_last_ts[sid] = max(session_last_ts.get(sid, 0), ts)
+                                owner_uid = self.resolve_turn_owner(ts, sid, timeline, session_owner_map, active_uid, default_uid)
+                                if owner_uid == uid:
+                                    sids.add(sid)
+                                    pts_float = float(pts)
+                                    session_credits[sid] = session_credits.get(sid, 0.0) + pts_float
+                                    session_turns[sid] = session_turns.get(sid, 0) + 1
+                                    session_last_ts[sid] = max(session_last_ts.get(sid, 0), ts)
                     except Exception:
                         pass
 
                 # Query session titles in chunks to avoid SQLite variable limit
-                if sids:
+                sids_list = list(sids)
+                if sids_list:
                     batch_size = 500
-                    for i in range(0, len(sids), batch_size):
-                        batch = sids[i:i + batch_size]
+                    for i in range(0, len(sids_list), batch_size):
+                        batch = sids_list[i:i + batch_size]
                         placeholders = ",".join("?" for _ in batch)
                         cur.execute(f"SELECT id, title, custom_title, updated_at FROM sessions WHERE id IN ({placeholders})", batch)
                         for sid, title, custom_title, upd in cur.fetchall():
@@ -594,6 +766,7 @@ class CreditMeter:
             "session_count": len(session_rows),
             "sessions": session_rows,
         }
+
 
     @staticmethod
     def render_overview(data: Dict[str, Any], use_color: bool = True, use_unicode_bar: bool = True, verbose: bool = False) -> str:
