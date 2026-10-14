@@ -2,7 +2,7 @@
 
 [![CI: Cross-Platform Matrix](https://github.com/FlapPearLabs/workbuddy-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit/actions/workflows/ci.yml)
 [![Release: v0.7.0](https://img.shields.io/badge/Release-v0.7.0-blue.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit)
-[![Tests: 146/146 Passed](https://img.shields.io/badge/Tests-146%2F146%20Passed-brightgreen.svg)](tests/)
+[![Tests: 147/147 Passed](https://img.shields.io/badge/Tests-147%2F147%20Passed-brightgreen.svg)](tests/)
 [![Security: Zero-Leak](https://img.shields.io/badge/Security-Zero--Leak%20Audit%20Passed-success.svg)](.github/workflows/ci.yml)
 [![Platform: macOS | Linux | Windows](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-brightgreen.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit)
 [![Python: 3.8+](https://img.shields.io/badge/Python-3.8+-green.svg)](https://python.org)
@@ -298,6 +298,7 @@ Toolkit 增加运行时兼容层，同时坚持一个边界：**需要解密能�
 - [事故 01：沙盒日志与快照耗尽](docs/incidents/INCIDENT_01_SANDBOX_LOG_SNAPSHOT_EXHAUSTION.md)
 - [事故 02：多 Agent Cargo 构建缓存压力](docs/incidents/INCIDENT_02_CARGO_MULTI_AGENT_SCCACHE.md)
 - [事故 04：Seatbelt 规则膨胀与 PTY 卡死](docs/incidents/INCIDENT_04_SEATBELT_RULE_EXPLOSION_AND_PTY_FREEZE.md)
+- [事故 05：多账号共享工作区积分虚增、免登录入账号漏计与 CI 假性全绿](docs/incidents/INCIDENT_05_MULTI_ACCOUNT_SESSION_OVERLAP_AND_TIMEZONE_DRIFT.md)
 
 [查看全部事故复盘 →](docs/incidents/README.md)
 
