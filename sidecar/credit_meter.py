@@ -68,6 +68,7 @@ class CreditMeter:
             self.db_path = os.path.join(self.workbuddy_dir, "workbuddy.db")
         self.profiles_dir = profiles_dir or os.path.join(self.workbuddy_dir, "auth_profiles")
         self.active_info_path = active_info_path or self._resolve_default_active_info()
+        self._session_turn_cache: Dict[str, Dict[str, int]] = {}
 
     @staticmethod
     def _resolve_default_active_info() -> str:
@@ -272,6 +273,76 @@ class CreditMeter:
         }
         return int(val * multipliers[unit])
 
+    def _find_session_jsonl(self, sid: str) -> Optional[str]:
+        if not self.workbuddy_dir or not sid:
+            return None
+        p1 = os.path.join(self.workbuddy_dir, "projects", "*", f"{sid}.jsonl")
+        m1 = glob.glob(p1)
+        if m1:
+            return m1[0]
+        p2 = os.path.join(self.workbuddy_dir, "projects", "*", "*", "subagents", f"{sid}.jsonl")
+        m2 = glob.glob(p2)
+        if m2:
+            return m2[0]
+        return None
+
+    def _get_session_turn_map(self, sid: str) -> Dict[str, int]:
+        if not hasattr(self, "_session_turn_cache"):
+            self._session_turn_cache = {}
+        if sid in self._session_turn_cache:
+            return self._session_turn_cache[sid]
+
+        turn_map: Dict[str, int] = {}
+        jsonl_path = self._find_session_jsonl(sid)
+        if jsonl_path and os.path.isfile(jsonl_path):
+            try:
+                ts_pattern = re.compile(r'"timestamp"\s*:\s*(\d{13})')
+                id_pattern = re.compile(r'"(id|messageId|conversationRequestId|traceId)"\s*:\s*"([^"]+)"')
+                with open(jsonl_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if '"timestamp"' not in line:
+                            continue
+                        m_ts = ts_pattern.search(line)
+                        if not m_ts:
+                            continue
+                        ts = int(m_ts.group(1))
+                        for _, val in id_pattern.findall(line):
+                            if val not in turn_map:
+                                turn_map[val] = ts
+            except Exception:
+                pass
+
+        self._session_turn_cache[sid] = turn_map
+        return turn_map
+
+    def resolve_turn_timestamp(self, req_id: str, sid: str, fallback_ts: int) -> int:
+        """Resolves the precise physical millisecond timestamp for a turn.
+        
+        Resolution order:
+        1. Valid RFC 9562 UUIDv7 extraction (instant O(1), no I/O)
+        2. Session jsonl message event log lookup (true physical turn execution time)
+        3. Fallback timestamp (session created_at / updated_at)
+        """
+        if isinstance(req_id, str):
+            clean_id = req_id.replace("-", "").strip().lower()
+            if len(clean_id) >= 12:
+                try:
+                    candidate = int(clean_id[:12], 16)
+                    if 1700000000000 <= candidate <= 1900000000000:
+                        if len(clean_id) < 13 or clean_id[12] == "7":
+                            return candidate
+                except Exception:
+                    pass
+
+            if sid:
+                turn_map = self._get_session_turn_map(sid)
+                if req_id in turn_map:
+                    return turn_map[req_id]
+                if clean_id in turn_map:
+                    return turn_map[clean_id]
+
+        return fallback_ts
+
     @staticmethod
     def extract_turn_timestamp(req_id: str, fallback_ts: int) -> int:
         """Extracts UUIDv7 millisecond epoch timestamp with RFC 9562 verification.
@@ -378,11 +449,13 @@ class CreditMeter:
                 # Infer earliest UID before the log started from storage directory creation/mtimes
                 storage_users = []
                 for p in glob.glob(os.path.join(self.workbuddy_dir, "storage", "user-*")):
-                    m = re.search(r"user-([0-9a-f\-]+)", os.path.basename(p))
+                    m = re.search(r"user-([a-zA-Z0-9_\-]+)", os.path.basename(p))
                     if m:
-                        clean_u = m.group(1).rstrip("-")
+                        clean_u = re.sub(r"-personal$", "", m.group(1)).rstrip("-")
                         try:
-                            storage_users.append((os.path.getmtime(p), clean_u))
+                            st = os.stat(p)
+                            earliest = int(min(st.st_mtime, st.st_ctime) * 1000)
+                            storage_users.append((earliest, clean_u))
                         except Exception:
                             pass
                 if storage_users:
@@ -394,6 +467,33 @@ class CreditMeter:
                 first_start = intervals[0][0]
                 if first_start > 0:
                     intervals.insert(0, (0, first_start, earliest_uid))
+
+                # Check if transitions were delayed due to AppStartup.log starting late
+                if len(intervals) >= 2 and storage_users:
+                    storage_map = {}
+                    for t_ms, u in storage_users:
+                        if u not in storage_map or t_ms < storage_map[u]:
+                            storage_map[u] = t_ms
+
+                    for i in range(1, len(intervals)):
+                        u_curr = intervals[i][2]
+                        if u_curr in storage_map:
+                            t_init = storage_map[u_curr]
+                            if t_init < intervals[i][0] and t_init > intervals[i - 1][0]:
+                                prev_s, _, prev_u = intervals[i - 1]
+                                _, curr_e, curr_u = intervals[i]
+                                intervals[i - 1] = (prev_s, t_init, prev_u)
+                                intervals[i] = (t_init, curr_e, curr_u)
+
+            # Consolidate any adjacent intervals with identical user UIDs
+            merged_intervals: List[Tuple[int, int, str]] = []
+            for s, e, u in intervals:
+                if merged_intervals and merged_intervals[-1][2] == u and merged_intervals[-1][1] == s:
+                    prev_s, _, _ = merged_intervals[-1]
+                    merged_intervals[-1] = (prev_s, e, u)
+                else:
+                    merged_intervals.append((s, e, u))
+            return merged_intervals
 
         return intervals
 
@@ -496,7 +596,7 @@ class CreditMeter:
                             try:
                                 cj = json.loads(cj_str)
                                 for req_id in cj:
-                                    t_ts = self.extract_turn_timestamp(req_id, upd or 0)
+                                    t_ts = self.resolve_turn_timestamp(req_id, s_id, upd or 0)
                                     for s, e, _ in user_intervals:
                                         if s <= t_ts < e:
                                             sids.append(s_id)
@@ -555,7 +655,7 @@ class CreditMeter:
                                 continue
                             if not math.isfinite(pts) or pts < 0:
                                 continue
-                            ts = self.extract_turn_timestamp(req_id, updated_at or 0)
+                            ts = self.resolve_turn_timestamp(req_id, sid, updated_at or 0)
                             if from_ts <= ts <= to_ts:
                                 pts_float = float(pts)
                                 total_unique_credits += pts_float
@@ -694,7 +794,7 @@ class CreditMeter:
                                 continue
                             if not math.isfinite(pts) or pts < 0:
                                 continue
-                            ts = self.extract_turn_timestamp(req_id, updated_at or 0)
+                            ts = self.resolve_turn_timestamp(req_id, sid, updated_at or 0)
                             if from_ts <= ts <= to_ts:
                                 owner_uid = self.resolve_turn_owner(ts, sid, timeline, session_owner_map, active_uid, default_uid)
                                 if owner_uid == uid:

@@ -593,6 +593,111 @@ class TestCreditMeterEngine(unittest.TestCase):
         self.assertEqual(len(drill_charlie["sessions"]), 1)
         self.assertEqual(drill_charlie["sessions"][0]["title"], "Charlie专属任务")
 
+    def test_11_non_uuidv7_turn_physical_timestamp_reconciliation(self):
+        """测试非 UUIDv7 请求 ID（如 32 位 MD5/hex）通过项目 jsonl 真实时间戳精确对齐，防 updated_at 漂移导致跨账号误判"""
+        tz = timezone(timedelta(hours=8))
+        now_dt = datetime(2026, 10, 14, 12, 0, 0, tzinfo=tz)
+        t_base = int(datetime(2026, 10, 14, 8, 0, 0, tzinfo=tz).timestamp() * 1000)
+
+        alice_uid = "u-alice-1111"
+        bob_uid = "u-bob-2222"
+
+        with open(self.active_info_path, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": bob_uid}}, f)
+
+        for alias, uid in [("Alice", alice_uid), ("Bob", bob_uid)]:
+            with open(os.path.join(self.profiles_dir, f"{alias}.info"), "w", encoding="utf-8") as f:
+                json.dump({"userId": uid, "nickname": alias}, f)
+
+        # Timeline: Alice 8:00 ~ 10:00, Bob 10:00 ~ 12:00
+        logs_dir = os.path.join(self.test_dir, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        with open(os.path.join(logs_dir, "AppStartup.log"), "w", encoding="utf-8") as f:
+            f.write(f"2026-10-14T08:00:00.000+08:00 [AppStartup] userId={alice_uid}\n")
+            f.write(f"2026-10-14T10:00:00.000+08:00 [AppStartup] userId={bob_uid}\n")
+
+        # Session: updated_at was bumped to 11:30 (during Bob's era!)
+        ts_updated_bump = t_base + 210 * 60 * 1000  # 11:30
+        ts_alice_turn = t_base + 30 * 60 * 1000    # 8:30 (during Alice's era)
+        sess_id = "sess-recon-test"
+        req_id = "md5hex888888888888888888888888888"
+
+        # Create session jsonl file in projects/my_project/sess-recon-test.jsonl
+        proj_dir = os.path.join(self.test_dir, "projects", "my_project")
+        os.makedirs(proj_dir, exist_ok=True)
+        jsonl_path = os.path.join(proj_dir, f"{sess_id}.jsonl")
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "id": "msg-001",
+                "timestamp": ts_alice_turn,
+                "providerData": {"messageId": req_id}
+            }) + "\n")
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO sessions (id, cwd, user_id, title, updated_at) VALUES (?, ?, '', ?, ?)",
+                    (sess_id, "/tmp", "对账测试任务", ts_updated_bump))
+        cur.execute("INSERT INTO session_usage VALUES (?, 10, 10, ?, ?)",
+                    (sess_id, ts_updated_bump, json.dumps({req_id: 88.5})))
+        conn.commit()
+        conn.close()
+
+        window = self.meter.parse_time_window(all_time=True, now_dt=now_dt)
+        data = self.meter.query_usage(window)
+
+        # 断言 1: 积分必须归属于 Alice (88.5 pts)，绝不能因为 updated_at 漂移到 11:30 而误判给 Bob
+        alice_acc = next((a for a in data["accounts"] if a["alias"] == "Alice"), None)
+        bob_acc = next((a for a in data["accounts"] if a["alias"] == "Bob"), None)
+        self.assertIsNotNone(alice_acc)
+        self.assertIsNotNone(bob_acc)
+        self.assertEqual(alice_acc["credits"], 88.5, f"Alice 真实积分应为 88.5: {alice_acc['credits']}")
+        self.assertEqual(bob_acc["credits"], 0.0, f"Bob 积分应为 0.0: {bob_acc['credits']}")
+
+        # 断言 2: 全局积分严格守恒
+        self.assertEqual(data["total_credits"], 88.5)
+
+        # 断言 3: 下钻 Alice 会话列表准确包含 sess-recon-test
+        drill = self.meter.query_account_drilldown("Alice", window)
+        self.assertEqual(len(drill["sessions"]), 1)
+        self.assertEqual(drill["sessions"][0]["session_id"], sess_id)
+        self.assertEqual(drill["sessions"][0]["credits"], 88.5)
+
+    def test_12_storage_init_backdating_timeline(self):
+        """测试 storage/user-* 物理初始化时间戳对 AppStartup.log 迟延记录的自愈回溯"""
+        tz = timezone(timedelta(hours=8))
+
+        alice_uid = "u-alice-old"
+        bob_uid = "u-bob-new"
+
+        # 模拟 storage/user-* 目录时间戳：Alice 7:00 初始化，Bob 9:00 初始化
+        t_alice_init = int(datetime(2026, 10, 14, 7, 0, 0, tzinfo=tz).timestamp())
+        alice_storage = os.path.join(self.test_dir, "storage", f"user-{alice_uid}")
+        os.makedirs(alice_storage, exist_ok=True)
+        os.utime(alice_storage, (t_alice_init, t_alice_init))
+
+        t_bob_init = int(datetime(2026, 10, 14, 9, 0, 0, tzinfo=tz).timestamp())
+        bob_storage = os.path.join(self.test_dir, "storage", f"user-{bob_uid}")
+        os.makedirs(bob_storage, exist_ok=True)
+        os.utime(bob_storage, (t_bob_init, t_bob_init))
+
+        # 但 AppStartup.log 因为轮转或冷启动，直到 10:00 才第一次打出 userId=u-bob-new
+        logs_dir = os.path.join(self.test_dir, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        with open(os.path.join(logs_dir, "AppStartup.log"), "w", encoding="utf-8") as f:
+            f.write(f"2026-10-14T08:00:00.000+08:00 [AppStartup] userId={alice_uid}\n")
+            f.write(f"2026-10-14T10:00:00.000+08:00 [AppStartup] userId={bob_uid}\n")
+
+        timeline = self.meter.build_account_timeline()
+        # 验证 Bob 的起始时间被平滑回溯到了 9:00 (1000 * t_bob_init)，而不是 10:00
+        bob_iv = next((iv for iv in timeline if iv[2] == bob_uid), None)
+        self.assertIsNotNone(bob_iv)
+        self.assertEqual(bob_iv[0], t_bob_init * 1000)
+
+        # Alice 的结束时间对齐到 Bob 的起始时间
+        alice_iv = next((iv for iv in timeline if iv[2] == alice_uid), None)
+        self.assertIsNotNone(alice_iv)
+        self.assertEqual(alice_iv[1], t_bob_init * 1000)
+
 
 if __name__ == "__main__":
     unittest.main()
