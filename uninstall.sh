@@ -89,6 +89,8 @@ rm -f "$INSTALL_BIN/wb-router"
 rm -f "$INSTALL_BIN/workbuddy-router"
 rm -f "$INSTALL_BIN/wb-sandbox"
 rm -f "$INSTALL_BIN/workbuddy-sandbox"
+rm -f "$INSTALL_BIN/wb-tool"
+rm -f "$INSTALL_BIN/workbuddy-tool"
 echo "✔ 已清理安装的 CLI 脚本"
 
 if [[ "$*" == *"-y"* ]] || [[ "$*" == *"--yes"* ]]; then

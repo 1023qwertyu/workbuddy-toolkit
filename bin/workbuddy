@@ -31,7 +31,7 @@ import webbrowser
 import datetime as _dt
 from datetime import datetime, timezone, timedelta
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 CLIENT_USER_AGENT = "WorkBuddy/5.6.2"
 PREFERRED_CHAT_MODELS = ["hy3", "deepseek-v4.1-flash", "glm-5.3-flash", "auto", "glm-5v-turbo"]
 
@@ -3849,6 +3849,35 @@ def _parse_audit_cli_args(args_list):
         i += 1
     return force, daemon_mode, interval_hours
 
+def run_interactive_tool_cmd(args=None):
+    """启动图形化交互控制中心 (wb-tool / workbuddy tool)"""
+    sidecar_dir = find_sidecar_dir()
+    if sidecar_dir not in sys.path:
+        sys.path.insert(0, sidecar_dir)
+    import interactive_tool
+    ctx = {
+        "version": VERSION,
+        "auth_file": AUTH_FILE,
+        "profiles_dir": PROFILES_DIR,
+        "db_file": DB_FILE,
+        "get_active_account": get_active_account,
+        "get_profiles": get_profiles,
+        "switch_to_profile": switch_to_profile,
+        "run_login": run_login,
+        "run_audit": run_audit,
+        "run_checkin": run_checkin,
+        "run_models_cmd": run_models_cmd,
+        "run_usage_cmd": run_usage_cmd,
+        "run_sandbox_cmd": run_sandbox_cmd,
+        "restart_workbuddy": restart_workbuddy,
+        "show_status": show_status,
+        "check_profile_health": check_profile_health,
+        "get_display_nickname": get_display_nickname,
+        "notify_desktop": notify_desktop,
+    }
+    code = interactive_tool.run_interactive_tool(ctx, args=args)
+    sys.exit(code)
+
 def print_help():
     print(f"""
 {COLOR_BOLD}WorkBuddy CLI (v{VERSION}){COLOR_RESET}
@@ -3858,6 +3887,7 @@ def print_help():
   或使用快捷别名 (如 wb-login, wb-switch)
 
 常用命令:
+  workbuddy tool                  启动图形化交互控制中心 (别名: wb-tool, workbuddy-tool)
   workbuddy help                  查看本帮助信息 (别名: wb-help, workbuddy-help)
   workbuddy login [别名] [--force] 独立免登扫码录入 (别名: wb-login)
   workbuddy switch [账号名]        免重新扫码切换账号 (别名: wb-switch)
@@ -3885,6 +3915,11 @@ def main():
     # 如果通过快捷帮助别名调用 (wb-help / workbuddy-help)
     if clean_prog in ("wb-help", "workbuddy-help") or clean_prog.endswith("-help"):
         print_help()
+        return
+
+    # 如果通过图形交互控制中心调用 (wb-tool / workbuddy-tool)
+    if clean_prog in ("wb-tool", "workbuddy-tool") or clean_prog.endswith(("-tool",)):
+        run_interactive_tool_cmd(args)
         return
 
     # 如果通过快捷别名调用
@@ -3951,6 +3986,9 @@ def main():
         return
 
     cmd = args[0].lower()
+    if cmd in ["tool", "tui", "toolbox", "box"]:
+        run_interactive_tool_cmd(args[1:])
+        return
     if cmd in ["--json", "-j"]:
         sub_args = args[1:]
         if not sub_args or any(s in ["list", "ls", "status", "info", "whoami"] for s in sub_args):

@@ -58,7 +58,9 @@ ln -sf "$INSTALL_BIN/workbuddy" "$INSTALL_BIN/wb-router"
 ln -sf "$INSTALL_BIN/workbuddy" "$INSTALL_BIN/workbuddy-router"
 ln -sf "$INSTALL_BIN/workbuddy" "$INSTALL_BIN/wb-sandbox"
 ln -sf "$INSTALL_BIN/workbuddy" "$INSTALL_BIN/workbuddy-sandbox"
-echo "   ✔ 已安装: workbuddy, workbuddy-log-guard, wb-help, wb-login, wb-audit, wb-list, wb-status, wb-switch, wb-checkin, wb-chat, wb-doctor, wb-models, wb-usage, wb-router, wb-sandbox"
+ln -sf "$INSTALL_BIN/workbuddy" "$INSTALL_BIN/wb-tool"
+ln -sf "$INSTALL_BIN/workbuddy" "$INSTALL_BIN/workbuddy-tool"
+echo "   ✔ 已安装: workbuddy, workbuddy-log-guard, wb-tool, wb-help, wb-login, wb-audit, wb-list, wb-status, wb-switch, wb-checkin, wb-chat, wb-doctor, wb-models, wb-usage, wb-router, wb-sandbox"
 
 # 3. 检查 PATH
 if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then

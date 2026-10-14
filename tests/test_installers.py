@@ -64,6 +64,8 @@ class TestInstallersE2E(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-usage.cmd")))
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "workbuddy-usage.cmd")))
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-sandbox.cmd")))
+            self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-tool.cmd")))
+            self.assertTrue(os.path.exists(os.path.join(bin_dir, "workbuddy-tool.cmd")))
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "workbuddy-log-guard.cmd")))
         else:
             bin_dir = os.path.join(self.temp_home, ".local", "bin")
@@ -84,6 +86,8 @@ class TestInstallersE2E(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-usage")))
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "workbuddy-usage")))
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-sandbox")))
+            self.assertTrue(os.path.exists(os.path.join(bin_dir, "wb-tool")))
+            self.assertTrue(os.path.exists(os.path.join(bin_dir, "workbuddy-tool")))
 
         # 3. 运行卸载器（输入 n 回答不回滚数据库）
         unres = subprocess.run([sys.executable, uninstaller], input="n\n", cwd=REPO_DIR, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -101,6 +105,8 @@ class TestInstallersE2E(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "wb-usage.cmd")))
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "workbuddy-usage.cmd")))
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "wb-sandbox.cmd")))
+            self.assertFalse(os.path.exists(os.path.join(bin_dir, "wb-tool.cmd")))
+            self.assertFalse(os.path.exists(os.path.join(bin_dir, "workbuddy-tool.cmd")))
         else:
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "workbuddy-log-guard")))
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "wb-help")))
@@ -112,6 +118,8 @@ class TestInstallersE2E(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "wb-usage")))
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "workbuddy-usage")))
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "wb-sandbox")))
+            self.assertFalse(os.path.exists(os.path.join(bin_dir, "wb-tool")))
+            self.assertFalse(os.path.exists(os.path.join(bin_dir, "workbuddy-tool")))
 
         # 验证 ~/.workbuddy/toolkit 伴随组件目录已物理 100% 移除
         toolkit_path = os.path.join(self.temp_home, ".workbuddy", "toolkit")

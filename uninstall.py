@@ -140,7 +140,8 @@ def uninstall():
             "wb-models", "workbuddy-models",
             "wb-usage", "workbuddy-usage",
             "wb-router", "workbuddy-router",
-            "wb-sandbox", "workbuddy-sandbox"
+            "wb-sandbox", "workbuddy-sandbox",
+            "wb-tool", "workbuddy-tool"
         ]:
             fpath = os.path.join(bin_dir, name)
             if os.path.islink(fpath) or os.path.exists(fpath):
