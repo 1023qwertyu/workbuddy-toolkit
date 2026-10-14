@@ -346,11 +346,14 @@ class CreditMeter:
             try:
                 with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
                     for line in f:
-                        m_time = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?[+-]\d{2}:\d{2})", line)
+                        m_time = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?)", line)
                         if not m_time:
                             continue
                         try:
-                            dt = datetime.fromisoformat(m_time.group(1))
+                            iso_str = m_time.group(1)
+                            if iso_str.endswith("Z"):
+                                iso_str = iso_str[:-1] + "+00:00"
+                            dt = datetime.fromisoformat(iso_str)
                             ts = int(dt.timestamp() * 1000)
                         except Exception:
                             continue

@@ -26,7 +26,7 @@ import sqlite3
 import shutil
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import importlib.util
@@ -492,8 +492,9 @@ class TestCreditMeterEngine(unittest.TestCase):
 
     def test_10_multi_account_shared_sessions_and_timeline_attribution(self):
         """测试多账号共享工作区下的唯一积分归集与时间线精确归因（防双重计费与防快照缺失漏账）"""
-        now_dt = datetime(2026, 10, 14, 12, 0, 0)
-        t_base = int(datetime(2026, 10, 14, 8, 0, 0).timestamp() * 1000)
+        tz = timezone(timedelta(hours=8))
+        now_dt = datetime(2026, 10, 14, 12, 0, 0, tzinfo=tz)
+        t_base = int(datetime(2026, 10, 14, 8, 0, 0, tzinfo=tz).timestamp() * 1000)
 
         # 1. 模拟三个账号: Alice (当前活跃), Bob (中间活跃), Charlie (早期活跃，无快照目录)
         alice_uid = "u-alice-1111"
