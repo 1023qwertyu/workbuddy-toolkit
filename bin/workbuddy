@@ -91,7 +91,8 @@ PROFILES_DIR = get_profiles_dir()
 DB_FILE = get_db_file()
 AUDIT_CACHE_FILE = get_audit_cache_file()
 
-HAS_COLOR = sys.platform != "win32" or "WT_SESSION" in os.environ or os.environ.get("TERM_PROGRAM") or sys.stdout.isatty()
+# 只在交互式终端输出 ANSI 颜色；管道、cron/launchd 日志与 NO_COLOR 环境下输出纯文本
+HAS_COLOR = bool(getattr(sys.stdout, "isatty", lambda: False)()) and "NO_COLOR" not in os.environ
 COLOR_GREEN = "\033[92m" if HAS_COLOR else ""
 COLOR_YELLOW = "\033[93m" if HAS_COLOR else ""
 COLOR_CYAN = "\033[96m" if HAS_COLOR else ""
@@ -395,15 +396,48 @@ def check_token_format(value):
             return "malformed"
     return "malformed"
 
+LINUX_APP_CANDIDATES = [
+    "/opt/WorkBuddy/workbuddy",
+    "/opt/workbuddy/workbuddy",
+    "/opt/apps/workbuddy/workbuddy",
+    "/usr/lib/workbuddy/workbuddy",
+    "/usr/bin/workbuddy",
+    "/usr/local/bin/workbuddy",
+]
+
+TOOLKIT_CLI_MARKER = b"WorkBuddy Multi-Account Manager & Automation Toolkit"
+
+def _is_toolkit_cli(path):
+    """判断某个可执行文件是否就是 Toolkit 自己的 CLI（例如 ~/.local/bin/workbuddy）。
+
+    Linux 上 Toolkit 的 CLI 与 WorkBuddy 客户端同名，`which workbuddy` 往往先命中 CLI，
+    把它当成 Electron 运行时会导致解密永远失败、"重启客户端"变成启动 CLI 自己。
+    """
+    try:
+        if os.path.realpath(path) == os.path.realpath(os.path.abspath(__file__)):
+            return True
+    except Exception:
+        pass
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+        return head.startswith(b"#!") and TOOLKIT_CLI_MARKER in head
+    except OSError:
+        return False
+
+def _is_runnable_file(path):
+    return bool(path) and os.path.isfile(path) and (sys.platform == "win32" or os.access(path, os.X_OK))
+
 def find_workbuddy_runtime():
     """
     定位本机 WorkBuddy 可执行文件/运行时路径。
     优先读取 WORKBUDDY_EXE 环境变量，其次按操作系统探测标准安装路径。
+    任何指向 Toolkit 自身 CLI 的候选都会被排除。
     """
     override = os.environ.get("WORKBUDDY_EXE")
     if override:
         path = os.path.abspath(os.path.expanduser(override))
-        if os.path.isfile(path) and (sys.platform == "win32" or os.access(path, os.X_OK)):
+        if _is_runnable_file(path) and not _is_toolkit_cli(path):
             return path
         raise CredentialError("INVALID_RUNTIME_PATH")
 
@@ -435,17 +469,14 @@ def find_workbuddy_runtime():
         if which_exe:
             candidates.append(which_exe)
     else:  # Linux
+        # 先查固定安装路径；PATH 中的 `workbuddy` 很可能是 Toolkit 自己（~/.local/bin/workbuddy）
+        candidates.extend(LINUX_APP_CANDIDATES)
         which_wb = shutil.which("workbuddy")
         if which_wb:
             candidates.append(which_wb)
-        candidates.extend([
-            "/opt/WorkBuddy/workbuddy",
-            "/opt/workbuddy/workbuddy",
-            os.path.expanduser("~/.local/bin/workbuddy")
-        ])
 
     for p in candidates:
-        if p and os.path.isfile(p) and (sys.platform == "win32" or os.access(p, os.X_OK)):
+        if _is_runnable_file(p) and not _is_toolkit_cli(p):
             return os.path.abspath(p)
 
     raise CredentialError("RUNTIME_NOT_FOUND")
@@ -496,14 +527,14 @@ def run_native_resolver(runtime_exe, request_payload):
             **popen_kwargs
         )
     except OSError:
-        raise CredentialError("RUNTIME_UNAVAILABLE")
+        raise CredentialError("RUNTIME_UNAVAILABLE") from None
 
     try:
         stdout_data, stderr_data = proc.communicate(input=data, timeout=AUTH_HELPER_TIMEOUT)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        raise CredentialError("HELPER_TIMEOUT")
+        raise CredentialError("HELPER_TIMEOUT") from None
 
     if len(stdout_data) > AUTH_OUTPUT_LIMIT:
         raise CredentialError("HELPER_PROTOCOL")
@@ -511,7 +542,8 @@ def run_native_resolver(runtime_exe, request_payload):
     try:
         reply = json.loads(stdout_data.decode("utf-8"))
     except Exception:
-        raise CredentialError("HELPER_PROTOCOL")
+        # from None: 不把含解密结果的原始输出链进异常上下文
+        raise CredentialError("HELPER_PROTOCOL") from None
 
     if not isinstance(reply, dict) or reply.get("version") != 1:
         raise CredentialError("HELPER_PROTOCOL")
@@ -562,21 +594,48 @@ def resolve_credential_field(raw_value, field_name="accessToken"):
             raise CredentialError("INVALID_FORMAT")
         return val
 
+_PLAINTEXT_FALLBACK_WARNED = False
+
+def _warn_plaintext_fallback(reason):
+    """加密失败而回退明文时必须显式告知用户，不能静默建立明文凭据库。
+
+    仅在"当前客户端本应加密"（活跃凭据为 sym-v1，或已找到运行时但加密失败）时提示；
+    旧版 WorkBuddy 原生就是明文存储，此时不打扰。
+    """
+    global _PLAINTEXT_FALLBACK_WARNED
+    if _PLAINTEXT_FALLBACK_WARNED:
+        return
+    active = get_active_account()
+    auth = active.get("auth") if isinstance(active, dict) else None
+    active_fmt = check_token_format(auth.get("accessToken")) if isinstance(auth, dict) else "missing"
+    if reason == "RUNTIME_NOT_FOUND" and active_fmt != "sym-v1":
+        return
+    _PLAINTEXT_FALLBACK_WARNED = True
+    detail = AUTH_REASONS.get(reason, reason)
+    sys.stderr.write(
+        f"{COLOR_YELLOW}▲ 无法调用 WorkBuddy 运行时加密凭据（{detail}），本次凭据将以明文保存在权限 0600 的本地文件中。"
+        f"修复运行时（可运行 workbuddy doctor 排查）后重新执行 wb-login 即可加密保存。{COLOR_RESET}\n"
+    )
+
 def encrypt_credential_field(plaintext, field_name="accessToken"):
     """
     如果 WorkBuddy 客户端运行时可用且支持原生存储加密，将明文字段加密为 $wbEncrypted 信封格式；
-    若运行时不可用或处于测试/回退环境，安全保留原始字符串，由 WorkBuddy 在启动时透明迁移。
+    若运行时不可用，保留原始字符串（旧版客户端的原生格式），并在本应加密时向 stderr 发出明确警告。
     """
     if not isinstance(plaintext, str) or not plaintext:
         return plaintext
+    reason = "HELPER_PROTOCOL"
     try:
         runtime = find_workbuddy_runtime()
         reply = run_native_resolver(runtime, {"operation": "encrypt", "value": plaintext})
         val = reply.get("value")
         if isinstance(val, dict) and val.get("$wbEncrypted") == 1:
             return val
+    except CredentialError as e:
+        reason = e.reason
     except Exception:
-        pass
+        reason = "HELPER_PROTOCOL"
+    _warn_plaintext_fallback(reason)
     return plaintext
 
 def get_display_nickname(account_data, default_name=""):
@@ -614,6 +673,31 @@ def get_display_nickname(account_data, default_name=""):
         return clean_uid[:8] if len(clean_uid) >= 8 else clean_uid
 
     return str(default_name) if default_name else "未知用户"
+
+def atomic_write_json(path, data, mode=0o600):
+    """原子写入 JSON 凭据/配置：同目录临时文件 (0600) + fsync + os.replace。
+
+    写到一半崩溃或断电时，目标文件要么是旧内容要么是新内容，不会出现半截 JSON
+    （get_profiles() 会静默跳过无法解析的文件，半写入会让账号"凭空消失"）。
+    """
+    import tempfile
+    target_dir = os.path.dirname(os.path.abspath(path))
+    os.makedirs(target_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=target_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        if sys.platform != "win32":
+            os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 def get_active_account():
     if not os.path.exists(AUTH_FILE):
@@ -746,73 +830,168 @@ def sync_active_token_to_profiles():
         return
 
     profiles = get_profiles()
-    for name, p in profiles.items():
+    for _name, p in profiles.items():
         if p["uid"] == active_uid:
             try:
-                with open(p["path"], "w", encoding="utf-8") as f:
-                    json.dump(active_data, f, indent=2, ensure_ascii=False)
-                if sys.platform != "win32":
-                    os.chmod(p["path"], 0o600)
+                atomic_write_json(p["path"], active_data)
             except Exception:
                 pass
 
+SESSION_OWNER_BACKUP_TABLE = "wbtk_session_owner_backup"
+AUTOMATION_OWNER_BACKUP_TABLE = "wbtk_automation_owner_backup"
+
+def _shared_workspace_sql():
+    """开启多账号工作区共享所需的 SQL（与 sql/install_triggers.sql 保持一致）。
+
+    在把 sessions.user_id 置空之前，先把原始归属写入旁路备份表；触发器同样先备份再置空。
+    这样 `workbuddy rollback` 可以把每个会话恢复到真正的原账号，而不是统一挂到某一个 UID 下。
+    """
+    t = SESSION_OWNER_BACKUP_TABLE
+    now = "CAST(strftime('%s','now') AS INTEGER)"
+    return [
+        f"CREATE TABLE IF NOT EXISTS {t} (session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, saved_at INTEGER NOT NULL)",
+        f"INSERT OR REPLACE INTO {t} (session_id, user_id, saved_at) "
+        f"SELECT id, user_id, {now} FROM sessions WHERE user_id IS NOT NULL AND user_id != ''",
+        "UPDATE sessions SET user_id = '' WHERE user_id IS NOT NULL AND user_id != ''",
+        # 旧版本触发器不备份归属：先删除再以新定义重建
+        "DROP TRIGGER IF EXISTS trg_sessions_force_shared_insert",
+        "DROP TRIGGER IF EXISTS trg_sessions_force_shared_update",
+        f"""CREATE TRIGGER trg_sessions_force_shared_insert
+        AFTER INSERT ON sessions
+        WHEN NEW.user_id != '' AND NEW.user_id IS NOT NULL
+        BEGIN
+            INSERT OR REPLACE INTO {t} (session_id, user_id, saved_at) VALUES (NEW.id, NEW.user_id, {now});
+            UPDATE sessions SET user_id = '' WHERE id = NEW.id;
+        END""",
+        f"""CREATE TRIGGER trg_sessions_force_shared_update
+        AFTER UPDATE OF user_id ON sessions
+        WHEN NEW.user_id != '' AND NEW.user_id IS NOT NULL
+        BEGIN
+            INSERT OR REPLACE INTO {t} (session_id, user_id, saved_at) VALUES (NEW.id, NEW.user_id, {now});
+            UPDATE sessions SET user_id = '' WHERE id = NEW.id;
+        END""",
+    ]
+
+def _table_exists(cur, name):
+    cur.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,))
+    return cur.fetchone() is not None
+
 def init_shared_workspace():
-    """Inject SQLite triggers so all accounts share workspace sessions seamlessly."""
+    """Inject SQLite triggers so all accounts share workspace sessions (reversible via rollback)."""
     if not os.path.exists(DB_FILE):
         print(f"{COLOR_RED}错误: 未找到 WorkBuddy 数据库 ({DB_FILE}){COLOR_RESET}")
         return False
 
-    print(f"正在配置数据库以支持多账号工作区互通...")
+    print("正在配置数据库以支持多账号工作区互通...")
+    con = None
     try:
-        con = sqlite3.connect(DB_FILE)
+        con = sqlite3.connect(DB_FILE, timeout=10.0)
         cur = con.cursor()
-        
-        # 1. 统一历史会话 user_id 为 ''
-        cur.execute("UPDATE sessions SET user_id = '' WHERE user_id IS NOT NULL AND user_id != '';")
-        
-        # 2. 建立共享触发器
-        cur.execute("""
-        CREATE TRIGGER IF NOT EXISTS trg_sessions_force_shared_insert
-        AFTER INSERT ON sessions
-        WHEN NEW.user_id != '' AND NEW.user_id IS NOT NULL
-        BEGIN
-            UPDATE sessions SET user_id = '' WHERE id = NEW.id;
-        END;
-        """)
-        cur.execute("""
-        CREATE TRIGGER IF NOT EXISTS trg_sessions_force_shared_update
-        AFTER UPDATE OF user_id ON sessions
-        WHEN NEW.user_id != '' AND NEW.user_id IS NOT NULL
-        BEGIN
-            UPDATE sessions SET user_id = '' WHERE id = NEW.id;
-        END;
-        """)
+        for stmt in _shared_workspace_sql():
+            cur.execute(stmt)
         con.commit()
-        con.close()
-        print(f"{COLOR_GREEN}✔ 全域会话共享触发器已成功激活！所有账号将共享相同的工作区和历史记录。{COLOR_RESET}")
+        cur.execute(f"SELECT COUNT(*) FROM {SESSION_OWNER_BACKUP_TABLE}")
+        backed_up = cur.fetchone()[0]
+        print(f"{COLOR_GREEN}✔ 全域会话共享触发器已激活！所有账号将共享相同的工作区和历史记录。{COLOR_RESET}")
+        print(f"  已备份 {backed_up} 个会话的原始账号归属，可随时运行 {COLOR_BOLD}workbuddy rollback{COLOR_RESET} 恢复。")
         return True
     except Exception as e:
+        if con is not None:
+            con.rollback()
         print(f"{COLOR_RED}配置失败: {e}{COLOR_RESET}")
         return False
+    finally:
+        if con is not None:
+            con.close()
 
 def rollback_shared_workspace(restore_uid=None):
-    """Remove SQLite triggers and optionally re-isolate sessions."""
+    """Remove sharing triggers and restore per-account session / automation ownership.
+
+    - 有备份记录的会话恢复到原始 user_id；
+    - restore_uid 只用于没有备份记录的会话（例如旧版本 init 时就已被清空的历史会话）；
+    - 切号时被改写的 automations.owner_user_id 同样恢复。
+    """
     if not os.path.exists(DB_FILE):
         return False
+    con = None
     try:
-        con = sqlite3.connect(DB_FILE)
+        con = sqlite3.connect(DB_FILE, timeout=10.0)
         cur = con.cursor()
         cur.execute("DROP TRIGGER IF EXISTS trg_sessions_force_shared_insert;")
         cur.execute("DROP TRIGGER IF EXISTS trg_sessions_force_shared_update;")
+
+        restored = 0
+        if _table_exists(cur, SESSION_OWNER_BACKUP_TABLE):
+            cur.execute(
+                f"UPDATE sessions SET user_id = (SELECT b.user_id FROM {SESSION_OWNER_BACKUP_TABLE} b WHERE b.session_id = sessions.id) "
+                f"WHERE (user_id IS NULL OR user_id = '') AND id IN (SELECT session_id FROM {SESSION_OWNER_BACKUP_TABLE})"
+            )
+            restored = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            cur.execute(f"DROP TABLE {SESSION_OWNER_BACKUP_TABLE}")
+
+        assigned = 0
         if restore_uid:
             cur.execute("UPDATE sessions SET user_id = ? WHERE user_id = '';", (restore_uid,))
+            assigned = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+        automations_restored = 0
+        if _table_exists(cur, AUTOMATION_OWNER_BACKUP_TABLE):
+            if _table_exists(cur, "automations"):
+                cur.execute(
+                    f"UPDATE automations SET owner_user_id = (SELECT b.owner_user_id FROM {AUTOMATION_OWNER_BACKUP_TABLE} b "
+                    f"WHERE b.automation_id = automations.id) WHERE id IN (SELECT automation_id FROM {AUTOMATION_OWNER_BACKUP_TABLE})"
+                )
+                automations_restored = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            cur.execute(f"DROP TABLE {AUTOMATION_OWNER_BACKUP_TABLE}")
+
+        cur.execute("SELECT COUNT(*) FROM sessions WHERE user_id = ''")
+        orphaned = cur.fetchone()[0]
         con.commit()
-        con.close()
+
         print(f"{COLOR_GREEN}✔ 共享触发器已移除，已恢复单账号数据隔离。{COLOR_RESET}")
+        print(f"  已恢复 {restored} 个会话的原始归属" + (f"，{assigned} 个会话归属到 {restore_uid}" if restore_uid else "")
+              + (f"，{automations_restored} 个自动化任务的原始所有者" if automations_restored else "") + "。")
+        if orphaned:
+            print(f"{COLOR_YELLOW}▲ 仍有 {orphaned} 个会话没有可恢复的原始归属（通常是旧版本 init 时就已被清空），"
+                  f"在各账号下都会可见。如需归属到指定账号: workbuddy rollback <UID>{COLOR_RESET}")
         return True
     except Exception as e:
+        if con is not None:
+            con.rollback()
         print(f"{COLOR_RED}回滚失败: {e}{COLOR_RESET}")
         return False
+    finally:
+        if con is not None:
+            con.close()
+
+def reassign_automations_owner(target_uid):
+    """切号时把未删除的自动化任务归属到当前账号；首次改写前备份原始所有者以便 rollback 恢复。"""
+    if not os.path.exists(DB_FILE) or not target_uid:
+        return False
+    con = None
+    try:
+        con = sqlite3.connect(DB_FILE, timeout=10.0)
+        cur = con.cursor()
+        if not _table_exists(cur, "automations"):
+            return False
+        cur.execute(
+            f"CREATE TABLE IF NOT EXISTS {AUTOMATION_OWNER_BACKUP_TABLE} "
+            f"(automation_id TEXT PRIMARY KEY, owner_user_id TEXT, saved_at INTEGER NOT NULL)"
+        )
+        cur.execute(
+            f"INSERT OR IGNORE INTO {AUTOMATION_OWNER_BACKUP_TABLE} (automation_id, owner_user_id, saved_at) "
+            f"SELECT id, owner_user_id, CAST(strftime('%s','now') AS INTEGER) FROM automations WHERE deleted_at IS NULL"
+        )
+        cur.execute("UPDATE automations SET owner_user_id = ? WHERE deleted_at IS NULL;", (target_uid,))
+        con.commit()
+        return True
+    except Exception:
+        if con is not None:
+            con.rollback()
+        return False
+    finally:
+        if con is not None:
+            con.close()
 
 # ==============================================================================
 # Terminal QR Code Generator (Pure-Python Zero-Dependency Implementation)
@@ -1106,11 +1285,7 @@ def get_audit_cache():
 
 def save_audit_cache(cache):
     try:
-        os.makedirs(os.path.dirname(AUDIT_CACHE_FILE), exist_ok=True)
-        with open(AUDIT_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, ensure_ascii=False)
-        if sys.platform != "win32":
-            os.chmod(AUDIT_CACHE_FILE, 0o600)
+        atomic_write_json(AUDIT_CACHE_FILE, cache)
     except Exception:
         pass
 
@@ -1283,30 +1458,14 @@ def check_profile_health(profile_info, force=False):
         prof_path = profile_info.get("path")
         if prof_path:
             try:
-                prof_tmp = prof_path + ".tmp"
-                if sys.platform != "win32":
-                    fd = os.open(prof_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                    with open(fd, "w", encoding="utf-8") as f:
-                        json.dump(profile_data, f, indent=2, ensure_ascii=False)
-                else:
-                    with open(prof_tmp, "w", encoding="utf-8") as f:
-                        json.dump(profile_data, f, indent=2, ensure_ascii=False)
-                os.replace(prof_tmp, prof_path)
+                atomic_write_json(prof_path, profile_data)
             except Exception:
                 pass
 
         active_data = get_active_account()
         if active_data and active_data.get("account", {}).get("uid") == uid:
             try:
-                auth_tmp = AUTH_FILE + ".tmp"
-                if sys.platform != "win32":
-                    fd = os.open(auth_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                    with open(fd, "w", encoding="utf-8") as f:
-                        json.dump(profile_data, f, indent=2, ensure_ascii=False)
-                else:
-                    with open(auth_tmp, "w", encoding="utf-8") as f:
-                        json.dump(profile_data, f, indent=2, ensure_ascii=False)
-                os.replace(auth_tmp, AUTH_FILE)
+                atomic_write_json(AUTH_FILE, profile_data)
             except Exception:
                 pass
 
@@ -1632,13 +1791,7 @@ def run_login(alias=None, auto_switch=True, force=False):
     final_alias, is_inplace = resolve_profile_alias_conflict(alias, uid, force=force)
     final_target_path = os.path.join(PROFILES_DIR, f"{final_alias}.info")
 
-    if sys.platform != "win32":
-        fd = os.open(final_target_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with open(fd, "w", encoding="utf-8") as f:
-            json.dump(profile_data, f, indent=2, ensure_ascii=False)
-    else:
-        with open(final_target_path, "w", encoding="utf-8") as f:
-            json.dump(profile_data, f, indent=2, ensure_ascii=False)
+    atomic_write_json(final_target_path, profile_data)
 
     cache = get_audit_cache()
     if uid:
@@ -1834,7 +1987,6 @@ def show_status(as_json=False):
         p_fmt = check_token_format(p_tok)
         h = check_profile_health(p, force=False) or {}
         h_status = h.get("status", "EXPIRED")
-        h_detail = h.get("detail", "未知状态")
         if h_status == "HEALTHY":
             h_badge = f"{COLOR_GREEN}[正常]{COLOR_RESET}"
         elif h_status == "REFRESHED":
@@ -1852,85 +2004,164 @@ def show_status(as_json=False):
         print(f" {tag} • {COLOR_BOLD}{name:<12}{COLOR_RESET} 昵称: {p.get('nickname', name)} (UID: {masked_uid}) [{p_fmt}] {h_badge} {exp_label}")
     print()
 
+def _linux_app_pids(app_path=None):
+    """按 /proc/<pid>/exe 精确定位 WorkBuddy 客户端进程（含 Electron 子进程）。
+
+    不使用 `pkill -f` 命令行模糊匹配：那会命中 `python3 ~/.local/bin/workbuddy switch ...`
+    这类 Toolkit 自身进程，导致切号流程在重启客户端之前就把自己 SIGTERM 掉。
+    解释器进程（python3 等）的 exe 不会是 WorkBuddy 二进制，因此天然被排除。
+    """
+    excluded = {os.getpid(), os.getppid()}
+    app_real = os.path.realpath(app_path) if app_path else None
+    pids = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return pids
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid in excluded:
+            continue
+        try:
+            exe = os.path.realpath(os.readlink(os.path.join("/proc", entry, "exe")))
+        except OSError:
+            continue
+        if app_real and exe == app_real:
+            pids.append(pid)
+        elif os.path.basename(exe) in ("workbuddy", "WorkBuddy") and not _is_toolkit_cli(exe):
+            pids.append(pid)
+    return sorted(pids)
+
+def _terminate_pids(pids, grace_seconds=5.0):
+    import signal
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + grace_seconds
+    alive = list(pids)
+    while alive and time.monotonic() < deadline:
+        time.sleep(0.1)
+        still = []
+        for pid in alive:
+            try:
+                os.kill(pid, 0)
+                # 已退出但未被回收的僵尸进程视为已结束
+                with open(f"/proc/{pid}/stat", "r") as f:
+                    if f.read().split(") ", 1)[-1].startswith("Z"):
+                        continue
+                still.append(pid)
+            except (OSError, IndexError):
+                pass
+        alive = still
+    for pid in alive:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+def _launch_detached(path):
+    env = {k: v for k, v in os.environ.items() if k != "ELECTRON_RUN_AS_NODE"}
+    subprocess.Popen([path], start_new_session=True, env=env,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 def restart_workbuddy():
+    """关闭并重新启动 WorkBuddy 客户端。返回是否成功拉起客户端。"""
     print(f"{COLOR_YELLOW}正在重启 WorkBuddy 客户端以生效凭证...{COLOR_RESET}")
+    started = False
     if sys.platform == "darwin":
         try:
             subprocess.run(["osascript", "-e", 'quit app "WorkBuddy"'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         except Exception:
             pass
         time.sleep(1.5)
-        res = subprocess.run(["pgrep", "-f", "WorkBuddy.app"], stdout=subprocess.PIPE, text=True)
+        res = subprocess.run(["pgrep", "-f", "WorkBuddy.app/Contents/MacOS"], stdout=subprocess.PIPE, text=True)
         if res.stdout.strip():
-            subprocess.run(["pkill", "-f", "WorkBuddy.app"], stderr=subprocess.DEVNULL)
+            subprocess.run(["pkill", "-f", "WorkBuddy.app/Contents/MacOS"], stderr=subprocess.DEVNULL)
             time.sleep(1)
-        subprocess.run(["open", "-a", "WorkBuddy"])
+        started = subprocess.run(["open", "-a", "WorkBuddy"]).returncode == 0
     elif sys.platform == "win32":
         try:
             subprocess.run(["taskkill", "/f", "/im", "WorkBuddy.exe"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         except Exception:
             pass
         time.sleep(1.5)
-        possible_paths = [
-            os.path.expandvars(r"%LOCALAPPDATA%\Programs\workbuddy\WorkBuddy.exe"),
-            os.path.expandvars(r"%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe"),
-            os.path.expandvars(r"%PROGRAMFILES%\WorkBuddy\WorkBuddy.exe"),
-            os.path.expandvars(r"%PROGRAMFILES(X86)%\WorkBuddy\WorkBuddy.exe"),
-            shutil.which("WorkBuddy.exe"),
-            shutil.which("workbuddy.exe"),
-        ]
-        started = False
-        for p in possible_paths:
-            if p and os.path.exists(p) and os.path.isfile(p):
-                if hasattr(os, "startfile"):
-                    os.startfile(p)
-                else:
-                    subprocess.Popen([p], shell=True)
-                started = True
-                break
-        if not started:
-            subprocess.Popen(["start", "workbuddy"], shell=True)
+        try:
+            app = find_workbuddy_runtime()
+        except CredentialError:
+            app = None
+        if app:
+            os.startfile(app)
+            started = True
     else:  # Linux
         try:
-            # Linux: target desktop application specifically, avoiding matching CLI scripts or working directories
-            subprocess.run(["pkill", "-x", "workbuddy"], stderr=subprocess.DEVNULL)
-            subprocess.run(["pkill", "-f", r"/workbuddy(\s|$|/opt)"], stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-        time.sleep(1.5)
-        possible_paths = [
-            shutil.which("workbuddy"),
-            "/usr/bin/workbuddy",
-            "/usr/local/bin/workbuddy",
-            "/opt/apps/workbuddy/workbuddy",
-            "/opt/workbuddy/workbuddy",
-            "/opt/WorkBuddy/workbuddy",
-            os.path.expanduser("~/.local/bin/workbuddy"),
-        ]
-        started = False
-        for p in possible_paths:
-            if p and os.path.exists(p) and os.path.isfile(p):
-                subprocess.Popen([p], start_new_session=True)
-                started = True
-                break
-        if not started:
-            subprocess.Popen(["workbuddy"], start_new_session=True)
+            app = find_workbuddy_runtime()
+        except CredentialError:
+            app = None
+        _terminate_pids(_linux_app_pids(app))
+        time.sleep(0.5)
+        if app:
+            _launch_detached(app)
+            started = True
 
-    print(f"{COLOR_GREEN}✔ WorkBuddy 已成功重启！{COLOR_RESET}")
+    if started:
+        print(f"{COLOR_GREEN}✔ WorkBuddy 已成功重启！{COLOR_RESET}")
+    else:
+        print(f"{COLOR_YELLOW}▲ 未找到 WorkBuddy 客户端可执行文件，请手动启动（或设置 WORKBUDDY_EXE 指向客户端）。{COLOR_RESET}")
+    return started
+
+UID_PREFIX_MIN_LEN = 4
+
+def resolve_profile_target(profiles, query, allow_uid_prefix=True, quiet=False):
+    """把用户输入解析为唯一的 Profile。返回 (alias, profile)，找不到或有歧义时返回 (None, None)。
+
+    优先级：精确别名 > 精确昵称 > 精确 UID > 唯一 UID 前缀（至少 4 位）。
+    同一优先级命中多个不同账号时拒绝猜测，并列出候选，避免"切到另一个账号"。
+    """
+    q = str(query or "").strip()
+    if not q or not profiles:
+        return None, None
+    ql = q.lower()
+
+    def _unique(names, level):
+        if not names:
+            return None
+        uids = {profiles[n].get("uid") or n for n in names}
+        if len(uids) == 1:
+            return names[0]
+        if not quiet:
+            listing = ", ".join(f"{n} (UID {str(profiles[n].get('uid') or '')[:8]}...)" for n in names)
+            print(f"{COLOR_RED}错误: '{q}' 按{level}匹配到多个账号: {listing}。请使用唯一的账号别名。{COLOR_RESET}")
+        return False
+
+    if q in profiles:
+        return q, profiles[q]
+    levels = [
+        ([n for n in profiles if n.lower() == ql], "别名"),
+        ([n for n, p in profiles.items() if str(p.get("nickname") or "").lower() == ql], "昵称"),
+        ([n for n, p in profiles.items() if p.get("uid") and str(p["uid"]) == q], "UID"),
+    ]
+    if allow_uid_prefix and len(q) >= UID_PREFIX_MIN_LEN:
+        levels.append(([n for n, p in profiles.items() if p.get("uid") and str(p["uid"]).startswith(q)], "UID 前缀"))
+    for names, level in levels:
+        hit = _unique(names, level)
+        if hit is False:
+            return None, None
+        if hit:
+            return hit, profiles[hit]
+    return None, None
 
 def switch_to_profile(target_name, auto_restart=True, check_health=True):
     profiles = get_profiles()
-    target = None
-    for name, p in profiles.items():
-        if name.lower() == target_name.lower() or p["nickname"].lower() == target_name.lower() or p["uid"].startswith(target_name):
-            target = p
-            target_name = name
-            break
-
+    matched_name, target = resolve_profile_target(profiles, target_name)
     if not target:
-        print(f"{COLOR_RED}错误: 未找到名为 '{target_name}' 的账号凭证。{COLOR_RESET}")
+        print(f"{COLOR_RED}错误: 未找到唯一匹配 '{target_name}' 的账号凭证。{COLOR_RESET}")
         print(f"可用账号列表: {', '.join(profiles.keys())}")
         return False
+    target_name = matched_name
 
     if check_health:
         health = check_profile_health(target, force=False)
@@ -1962,29 +2193,19 @@ def switch_to_profile(target_name, auto_restart=True, check_health=True):
         print(f"{COLOR_GREEN}当前已处于账号 '{target_name}' ({target['nickname']})，无需切换。{COLOR_RESET}")
         return True
 
-    print(f"1. 正在同步当前账号最新 Token 到本地备份库...")
+    print("1. 正在同步当前账号最新 Token 到本地备份库...")
     sync_active_token_to_profiles()
 
     print(f"2. 正在激活账号: {COLOR_BOLD}{COLOR_GREEN}{target_name} ({target['nickname']}){COLOR_RESET} ...")
-    os.makedirs(os.path.dirname(AUTH_FILE), exist_ok=True)
-    tmp_file = AUTH_FILE + ".tmp"
-    if sys.platform != "win32":
-        fd = os.open(tmp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with open(fd, "w", encoding="utf-8") as f:
-            json.dump(target["data"], f, indent=2, ensure_ascii=False)
-    else:
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(target["data"], f, indent=2, ensure_ascii=False)
-    
     try:
-        os.replace(tmp_file, AUTH_FILE)
+        atomic_write_json(AUTH_FILE, target["data"])
     except PermissionError:
         # Windows: 若运行中的客户端锁定了凭证文件，先关闭进程再替换
         if sys.platform == "win32":
             print(f"{COLOR_YELLOW}检测到凭证文件被客户端锁定，正在提前关闭 WorkBuddy 进程以释放文件锁...{COLOR_RESET}")
             subprocess.run(["taskkill", "/f", "/im", "WorkBuddy.exe"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
             time.sleep(1.2)
-            os.replace(tmp_file, AUTH_FILE)
+            atomic_write_json(AUTH_FILE, target["data"])
         else:
             raise
 
@@ -1995,15 +2216,7 @@ def switch_to_profile(target_name, auto_restart=True, check_health=True):
         except Exception:
             pass
 
-    if os.path.exists(DB_FILE):
-        try:
-            con = sqlite3.connect(DB_FILE)
-            cur = con.cursor()
-            cur.execute("UPDATE automations SET owner_user_id = ? WHERE deleted_at IS NULL;", (target["uid"],))
-            con.commit()
-            con.close()
-        except Exception:
-            pass
+    reassign_automations_owner(target["uid"])
 
     print(f"{COLOR_GREEN}✔ 凭证已成功切换至: {target_name} ({target['nickname']}) (免扫码生效){COLOR_RESET}")
 
@@ -2080,15 +2293,11 @@ def run_chat(target_name=None, prompt="请回复：你好", model=None, send_all
     profiles = get_profiles()
 
     targets = {}
+    resolved_name, resolved_prof = resolve_profile_target(profiles, target_name, allow_uid_prefix=False, quiet=True) if target_name else (None, None)
     if send_all:
         targets = profiles
-    elif target_name and target_name in profiles:
-        targets[target_name] = profiles[target_name]
-    elif target_name and any(p["nickname"].lower() == target_name.lower() for p in profiles.values()):
-        for name, p in profiles.items():
-            if p["nickname"].lower() == target_name.lower():
-                targets[name] = p
-                break
+    elif resolved_prof:
+        targets[resolved_name] = resolved_prof
     else:
         if target_name:
             prompt = target_name
@@ -2180,7 +2389,7 @@ def parse_and_run_chat(args):
     profiles = get_profiles()
     if rem_args:
         first = rem_args[0]
-        if first in profiles or any(p["nickname"].lower() == first.lower() for p in profiles.values()):
+        if resolve_profile_target(profiles, first, allow_uid_prefix=False, quiet=True)[1]:
             target_name = first
             rem_args = rem_args[1:]
 
@@ -2299,13 +2508,7 @@ def run_checkin(target_name=None, with_chat=True):
                 idx += 1
             auto_path = os.path.join(PROFILES_DIR, f"{cand}.info")
             try:
-                if sys.platform != "win32":
-                    fd = os.open(auto_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                    with open(fd, "w", encoding="utf-8") as f:
-                        json.dump(active_data, f, indent=2, ensure_ascii=False)
-                else:
-                    with open(auto_path, "w", encoding="utf-8") as f:
-                        json.dump(active_data, f, indent=2, ensure_ascii=False)
+                atomic_write_json(auto_path, active_data)
                 print(f"{COLOR_GREEN}✔ 检测到新登录账号，已自动保存 Profile: '{cand}' (昵称: {nickname}){COLOR_RESET}")
                 profiles = get_profiles()
             except Exception:
@@ -2317,13 +2520,11 @@ def run_checkin(target_name=None, with_chat=True):
 
     targets = {}
     if target_name:
-        for name, p in profiles.items():
-            if name.lower() == target_name.lower() or p["nickname"].lower() == target_name.lower():
-                targets[name] = p
-                break
-        if not targets:
+        t_name, t_prof = resolve_profile_target(profiles, target_name, allow_uid_prefix=False)
+        if not t_prof:
             print(f"{COLOR_RED}未找到账号: {target_name}{COLOR_RESET}")
             return
+        targets[t_name] = t_prof
     else:
         targets = profiles
 
@@ -2461,7 +2662,7 @@ def interactive_menu():
     profiles = get_profiles()
     if not profiles:
         print(f"{COLOR_RED}未在 ~/.workbuddy/auth_profiles 中发现任何保存的账号凭证。{COLOR_RESET}")
-        print(f"请登录一个账号后，在终端执行: workbuddy save <别名>")
+        print("请登录一个账号后，在终端执行: workbuddy save <别名>")
         return
 
     active_data = get_active_account()
@@ -2477,7 +2678,7 @@ def interactive_menu():
             match_active = f"{name} ({p['nickname']})"
             break
     print(f"当前在线账号: {COLOR_BOLD}{COLOR_GREEN}{match_active or '未知 / 未登录'}{COLOR_RESET}")
-    print(f"\n请选择要切换的目标账号 (一次保存，永久免扫码):")
+    print("\n请选择要切换的目标账号 (一次保存，永久免扫码):")
 
     keys = list(profiles.keys())
     for idx, name in enumerate(keys, 1):
@@ -2524,13 +2725,7 @@ def save_current(name, force=False):
 
     final_name, is_inplace = resolve_profile_alias_conflict(name, uid, force=force)
     target_path = os.path.join(PROFILES_DIR, f"{final_name}.info")
-    if sys.platform != "win32":
-        fd = os.open(target_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with open(fd, "w", encoding="utf-8") as f:
-            json.dump(active_data, f, indent=2, ensure_ascii=False)
-    else:
-        with open(target_path, "w", encoding="utf-8") as f:
-            json.dump(active_data, f, indent=2, ensure_ascii=False)
+    atomic_write_json(target_path, active_data)
     if is_inplace:
         print(f"{COLOR_GREEN}✔ 当前登录态已在位平滑更新至 Profile: '{final_name}' (昵称: {nickname}, UID: {uid}){COLOR_RESET}")
     else:
@@ -2806,6 +3001,25 @@ def split_log_into_records(chunk_text, reference_ts=None, window_cutoff=None):
 
     return records
 
+# 否定表达剥离规则（OOM 与资源配额分类器共用），在建立上下文前剥离，避免
+# 'RLIMIT_CPU was not exceeded'、'no process was killed' 之类的否定子句建立假上下文
+LIMIT_NEGATION_PATTERNS = [
+    r"no\s+process(?:es)?(?:\s+was|\s+were)?\s+killed",
+    r"(?:not|was\s+not|were\s+not)\s+killed",
+    r"\bno\s+kill\b",
+    r"\bno\s+oom\b",
+    r"\b(?:not|was\s+not|were\s+not|does\s+not|did\s+not|do\s+not|is\s+not|are\s+not|has\s+not|have\s+not|had\s+not|cannot|can't|can\s+not|could\s+not|couldn't|will\s+not|won't|would\s+not|wouldn't|should\s+not|shouldn't|shall\s+not|shan't|must\s+not|mustn't|may\s+not|might\s+not|doesn't|didn't|don't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't)(?:\s+(?:currently|actually|presently|yet|immediately))?(?:\s+(?:be|been))?\s+(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
+    r"\b(?:was|were|is|are|has|have|had)?\s*never(?:\s+(?:currently|actually|presently|yet|immediately))?(?:\s+(?:be|been))?\s+(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
+    r"\bno\s+longer\s+(?:be\s+)?(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
+    r"(?:limit|quota)\s+(?:cannot|can't|can\s+not|could\s+not|couldn't|will\s+not|won't|must\s+not|should\s+not|is\s+not|was\s+not|are\s+not|were\s+not|not|never)\s+(?:be\s+)?(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
+    r"without\s+(?:being\s+)?(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
+    r"\bno\s+(?:exceed(?:s|ed|ing)?|exhaustion)\b",
+    r"\b(?:memory\.(?:max|high|low|min)|rlimit_[a-z0-9_]+|(?:hard\s+|soft\s+)?limit|quota|capacity|threshold|rlimit)\s+(?:still\s+|currently\s+|presently\s+|comfortably\s+|amply\s+)?exceed(?:s|ed|ing)?\s+(?:(?:current|actual|present)\s+)?(?:usage|consumption|footprint|rss|demand|load|bytes|size|requirement)\b",
+    r"without\s+killing",
+]
+RLIMIT_CANON = r"(?:rlimit_(?:cpu|fsize|data|stack|core|rss|nproc|nofile|ofile|memlock|as|locks|sigpending|msgqueue|nice|rtprio|rttime)|rlimit)"
+RLIMIT_META_KEYS = r"(?:soft|hard|cur|current|max|min|val|value|usage|used|count|limit)"
+
 def check_oom_event(text):
     """
     评估日志文本是否包含真实宿主/内核全局 OOM / Jetsam 杀伤事件 (Family C)。
@@ -2820,20 +3034,7 @@ def check_oom_event(text):
 
     # 剥离否定表达（包括 limit_negations 与 oom_negations），避免如 'RLIMIT_CPU was not exceeded' 误激活结构化配额排除
     cleaned = t_lower
-    limit_negations = [
-        r"no\s+process(?:es)?(?:\s+was|\s+were)?\s+killed",
-        r"(?:not|was\s+not|were\s+not)\s+killed",
-        r"\bno\s+kill\b",
-        r"\bno\s+oom\b",
-        r"\b(?:not|was\s+not|were\s+not|does\s+not|did\s+not|do\s+not|is\s+not|are\s+not|has\s+not|have\s+not|had\s+not|cannot|can't|can\s+not|could\s+not|couldn't|will\s+not|won't|would\s+not|wouldn't|should\s+not|shouldn't|shall\s+not|shan't|must\s+not|mustn't|may\s+not|might\s+not|doesn't|didn't|don't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't)(?:\s+(?:currently|actually|presently|yet|immediately))?(?:\s+(?:be|been))?\s+(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
-        r"\b(?:was|were|is|are|has|have|had)?\s*never(?:\s+(?:currently|actually|presently|yet|immediately))?(?:\s+(?:be|been))?\s+(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
-        r"\bno\s+longer\s+(?:be\s+)?(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
-        r"(?:limit|quota)\s+(?:cannot|can't|can\s+not|could\s+not|couldn't|will\s+not|won't|must\s+not|should\s+not|is\s+not|was\s+not|are\s+not|were\s+not|not|never)\s+(?:be\s+)?(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
-        r"without\s+(?:being\s+)?(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
-        r"\bno\s+(?:exceed(?:s|ed|ing)?|exhaustion)\b",
-        r"\b(?:memory\.(?:max|high|low|min)|rlimit_[a-z0-9_]+|(?:hard\s+|soft\s+)?limit|quota|capacity|threshold|rlimit)\s+(?:still\s+|currently\s+|presently\s+|comfortably\s+|amply\s+)?exceed(?:s|ed|ing)?\s+(?:(?:current|actual|present)\s+)?(?:usage|consumption|footprint|rss|demand|load|bytes|size|requirement)\b",
-        r"without\s+killing",
-    ]
+    limit_negations = LIMIT_NEGATION_PATTERNS
     for neg in limit_negations:
         cleaned = re.sub(neg, " ", cleaned)
 
@@ -2851,8 +3052,8 @@ def check_oom_event(text):
     # 结构化 cgroup/rlimit 约束杀伤必须归 Family D，排除在全局 Family C 之外。
     # 必须具备确定性因果证据，严禁仅凭信息性标识（如 'RLIMIT_CPU is unlimited'）误排除 Host OOM。
     # 必须在剥离否定后评估结构化上下文，避免如 'RLIMIT_CPU was not exceeded' 误抑制 Host OOM。
-    rlimit_canon = r"(?:rlimit_(?:cpu|fsize|data|stack|core|rss|nproc|nofile|ofile|memlock|as|locks|sigpending|msgqueue|nice|rtprio|rttime)|rlimit)"
-    meta_keys = r"(?:soft|hard|cur|current|max|min|val|value|usage|used|count|limit)"
+    rlimit_canon = RLIMIT_CANON
+    meta_keys = RLIMIT_META_KEYS
     cgroup_structural_contexts = [
         r"\bmemory\s+cgroup\s+out\s+of\s+memory\b",
         r"\bcgroup\s+(?:[a-z0-9_.-]+\s+)*(?:out\s+of\s+memory|oom|limit|controller|quota)\b",
@@ -2911,25 +3112,12 @@ def check_resource_limit_event(text):
     # 剥离否定表达（包含情态助动词否定如 cannot, can't, could not, will not, was not exceeded 等）
     # 严格在建立上下文前剥离，确保否定子句（如 'RLIMIT_CPU was not exceeded'）不会建立假上下文
     cleaned = t_lower
-    limit_negations = [
-        r"no\s+process(?:es)?(?:\s+was|\s+were)?\s+killed",
-        r"(?:not|was\s+not|were\s+not)\s+killed",
-        r"\bno\s+kill\b",
-        r"\bno\s+oom\b",
-        r"\b(?:not|was\s+not|were\s+not|does\s+not|did\s+not|do\s+not|is\s+not|are\s+not|has\s+not|have\s+not|had\s+not|cannot|can't|can\s+not|could\s+not|couldn't|will\s+not|won't|would\s+not|wouldn't|should\s+not|shouldn't|shall\s+not|shan't|must\s+not|mustn't|may\s+not|might\s+not|doesn't|didn't|don't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't)(?:\s+(?:currently|actually|presently|yet|immediately))?(?:\s+(?:be|been))?\s+(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
-        r"\b(?:was|were|is|are|has|have|had)?\s*never(?:\s+(?:currently|actually|presently|yet|immediately))?(?:\s+(?:be|been))?\s+(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
-        r"\bno\s+longer\s+(?:be\s+)?(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
-        r"(?:limit|quota)\s+(?:cannot|can't|can\s+not|could\s+not|couldn't|will\s+not|won't|must\s+not|should\s+not|is\s+not|was\s+not|are\s+not|were\s+not|not|never)\s+(?:be\s+)?(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
-        r"without\s+(?:being\s+)?(?:exceed(?:s|ed|ing)?|exhaust(?:ed|ing)?)\b",
-        r"\bno\s+(?:exceed(?:s|ed|ing)?|exhaustion)\b",
-        r"\b(?:memory\.(?:max|high|low|min)|rlimit_[a-z0-9_]+|(?:hard\s+|soft\s+)?limit|quota|capacity|threshold|rlimit)\s+(?:still\s+|currently\s+|presently\s+|comfortably\s+|amply\s+)?exceed(?:s|ed|ing)?\s+(?:(?:current|actual|present)\s+)?(?:usage|consumption|footprint|rss|demand|load|bytes|size|requirement)\b",
-        r"without\s+killing",
-    ]
+    limit_negations = LIMIT_NEGATION_PATTERNS
     for neg in limit_negations:
         cleaned = re.sub(neg, " ", cleaned)
 
-    rlimit_canon = r"(?:rlimit_(?:cpu|fsize|data|stack|core|rss|nproc|nofile|ofile|memlock|as|locks|sigpending|msgqueue|nice|rtprio|rttime)|rlimit)"
-    meta_keys = r"(?:soft|hard|cur|current|max|min|val|value|usage|used|count|limit)"
+    rlimit_canon = RLIMIT_CANON
+    meta_keys = RLIMIT_META_KEYS
     limit_contexts = [
         r"\bmemory\s+cgroup\s+out\s+of\s+memory\b",
         r"\bcgroup\s+(?:[a-z0-9_.-]+\s+)*(?:out\s+of\s+memory|oom|limit|exhausted|kill|controller|quota)\b",
@@ -2965,6 +3153,26 @@ def check_resource_limit_event(text):
     ]
     return any(bool(re.search(e, cleaned)) for e in limit_events)
 
+def probe_session_rule_counts(guard, sock, uid, monitor_timeout=3.0, per_session_timeout=2.0, limit=10):
+    """查询 sandbox-center 最活跃的若干会话的规则数，返回 (最大规则数, 对应 sessionId)。doctor 与 137 取证共用。"""
+    max_count, bloated_session_id = 0, None
+    try:
+        mon = guard.send_sandbox_ipc(sock, "sandbox.monitor.query", {}, uid=uid, timeout=monitor_timeout)
+        if mon and mon.get("success"):
+            for bucket in mon.get("data", {}).get("decideBucketsTop", [])[:limit]:
+                sid = bucket.get("sessionId")
+                if not sid:
+                    continue
+                resp = guard.send_sandbox_ipc(sock, "sandbox.rules.get_rules", {"sessionId": sid},
+                                              uid=uid, session_id=sid, timeout=per_session_timeout)
+                if resp and resp.get("success"):
+                    cnt = len(resp.get("data", {}).get("fileRules", []))
+                    if cnt > max_count:
+                        max_count, bloated_session_id = cnt, sid
+    except Exception:
+        pass
+    return max_count, bloated_session_id
+
 def inspect_137_failure(target_log_dir=None, incident_window_minutes=30):
     """
     轻量级 137 / shell 事故现场指纹分析器与归因分类器。
@@ -2998,7 +3206,7 @@ def inspect_137_failure(target_log_dir=None, incident_window_minutes=30):
     if sock and guard:
         resp = guard.send_sandbox_ipc(sock, "sandbox.rules.get_rules", {}, uid=target_uid, timeout=3.0)
         last_ipc_diag = None
-        if hasattr(guard, "get_last_ipc_diag") and callable(getattr(guard, "get_last_ipc_diag")):
+        if hasattr(guard, "get_last_ipc_diag") and callable(guard.get_last_ipc_diag):
             try:
                 d = guard.get_last_ipc_diag()
                 if isinstance(d, dict):
@@ -3013,21 +3221,8 @@ def inspect_137_failure(target_log_dir=None, incident_window_minutes=30):
             temp_wildcards_present = any(p in paths for p in ["/var/folders/**", "/tmp/**"])
 
             # 探测各活跃会话规则数
-            try:
-                m_resp = guard.send_sandbox_ipc(sock, "sandbox.monitor.query", {}, uid=target_uid, timeout=3.0)
-                if m_resp and m_resp.get("success"):
-                    top_sessions = m_resp.get("data", {}).get("decideBucketsTop", [])
-                    for s_item in top_sessions[:10]:
-                        s_id = s_item.get("sessionId")
-                        if s_id:
-                            s_res = guard.send_sandbox_ipc(sock, "sandbox.rules.get_rules", {"sessionId": s_id}, uid=target_uid, session_id=s_id, timeout=2.0)
-                            if s_res and s_res.get("success"):
-                                cnt = len(s_res.get("data", {}).get("fileRules", []))
-                                if cnt > max_session_rules_count:
-                                    max_session_rules_count = cnt
-                                    bloated_session_id = s_id
-            except Exception:
-                pass
+            max_session_rules_count, bloated_session_id = probe_session_rule_counts(
+                guard, sock, target_uid, monitor_timeout=3.0, per_session_timeout=2.0)
 
     # 探测 sandbox-center 进程 CPU 与常驻内存
     center_cpu = None
@@ -3137,7 +3332,7 @@ def inspect_137_failure(target_log_dir=None, incident_window_minutes=30):
             pass
     log_candidates.sort(key=lambda x: x[0], reverse=True)
 
-    for mtime, fp, size in log_candidates[:10]:
+    for _mtime, fp, size in log_candidates[:10]:
         try:
             with open(fp, "rb") as f:
                 offset = max(0, size - TAIL_LIMIT_BYTES - TAIL_BACKTRACK_BYTES) if size > TAIL_LIMIT_BYTES else 0
@@ -3273,8 +3468,11 @@ def inspect_137_failure(target_log_dir=None, incident_window_minutes=30):
         "sandbox_center_found": center_found,
         "sandbox_center_responsive": center_responsive,
         "sandbox_center_cpu_percent": center_cpu,
+        "sandbox_center_pid": center_pid,
         "sandbox_rule_count": global_rules_count,
         "max_session_rule_count": max_session_rules_count,
+        "bloated_session_id": bloated_session_id,
+        "gui_running": gui_running,
         "temp_wildcards_present": temp_wildcards_present,
         "memory_pressure": mem_pressure,
         "ipc_diagnostic": last_ipc_diag,
@@ -3283,8 +3481,10 @@ def inspect_137_failure(target_log_dir=None, incident_window_minutes=30):
             "center_responsive": center_responsive,
             "global_rules_count": global_rules_count,
             "max_session_rules_count": max_session_rules_count,
+            "bloated_session_id": bloated_session_id,
             "temp_wildcards_present": temp_wildcards_present,
             "memory_pressure": mem_pressure,
+            "gui_running": gui_running,
         },
         "incident_evidence": incident_evidence,
         "historical_evidence": historical_evidence,
@@ -3347,7 +3547,7 @@ def run_doctor(args=None):
             print(f"  Failure Family      : Family {fp['root_cause_family']}")
             print(f"  Confidence          : {fp['confidence']}")
             print(f"  Attribution Reason  : {fp['reason']}")
-            print(f"  Taxonomy Scope      : Families A~H defined; automatic classifier covers A, B, C, D, E, H\n")
+            print("  Taxonomy Scope      : Families A~H defined; automatic classifier covers A, B, C, D, E, H\n")
         return fp['classification'] != "RULE_EXPLOSION_LIKELY"
 
     print(f"\n{COLOR_BOLD}{COLOR_CYAN}=== WorkBuddy Toolkit Doctor ==={COLOR_RESET}\n")
@@ -3417,6 +3617,15 @@ def run_doctor(args=None):
 
     profiles = get_profiles()
     print(f"Profile count         : {len(profiles)}")
+    if resolver_avail or token_fmt == "sym-v1":
+        plaintext_profiles = []
+        for p_name, p in profiles.items():
+            p_auth = p["data"].get("auth") if isinstance(p.get("data"), dict) else None
+            if isinstance(p_auth, dict) and check_token_format(p_auth.get("accessToken")) == "plaintext":
+                plaintext_profiles.append(p_name)
+        if plaintext_profiles:
+            print(f"Plaintext profiles    : {COLOR_YELLOW}{len(plaintext_profiles)} ({', '.join(plaintext_profiles[:5])}; "
+                  f"stored unencrypted, re-run wb-login <alias> to encrypt){COLOR_RESET}")
 
     # 判断 API capability
     api_ready = False
@@ -3468,7 +3677,7 @@ def run_doctor(args=None):
         if sock:
             resp = guard.send_sandbox_ipc(sock, "sandbox.rules.get_rules", {}, uid=target_uid)
             diag = None
-            if hasattr(guard, "get_last_ipc_diag") and callable(getattr(guard, "get_last_ipc_diag")):
+            if hasattr(guard, "get_last_ipc_diag") and callable(guard.get_last_ipc_diag):
                 try:
                     d = guard.get_last_ipc_diag()
                     if isinstance(d, dict):
@@ -3482,23 +3691,8 @@ def run_doctor(args=None):
                 has_temp = any(p in paths for p in ["/var/folders/**", "/tmp/**"])
 
                 # 探测各活跃会话规则数以捕获 session-level 规则爆炸
-                max_session_rules = 0
-                bloated_session_id = None
-                try:
-                    mon_resp = guard.send_sandbox_ipc(sock, "sandbox.monitor.query", {}, uid=target_uid, timeout=2.0)
-                    if mon_resp and mon_resp.get("success"):
-                        buckets = mon_resp.get("data", {}).get("decideBucketsTop", [])
-                        for b in buckets[:10]:
-                            sid = b.get("sessionId")
-                            if sid:
-                                s_resp = guard.send_sandbox_ipc(sock, "sandbox.rules.get_rules", {"sessionId": sid}, uid=target_uid, session_id=sid, timeout=1.5)
-                                if s_resp and s_resp.get("success"):
-                                    s_count = len(s_resp.get("data", {}).get("fileRules", []))
-                                    if s_count > max_session_rules:
-                                        max_session_rules = s_count
-                                        bloated_session_id = sid
-                except Exception:
-                    pass
+                max_session_rules, bloated_session_id = probe_session_rule_counts(
+                    guard, sock, target_uid, monitor_timeout=2.0, per_session_timeout=1.5)
 
                 if max_session_rules > 1000:
                     sandbox_status = f"{COLOR_RED}RISK (Session {bloated_session_id[:8]}... has {max_session_rules} rules, high SBPL lockup risk){COLOR_RESET}"
@@ -3563,13 +3757,13 @@ def run_doctor(args=None):
     print(f"Non-invasive Sidecar  : {COLOR_GREEN}ACTIVE (Zero app-bundle modifications; 100% fail-safe){COLOR_RESET}")
     if has_warning_or_risk:
         print(f"Upstream Drift Notice : {COLOR_YELLOW}POTENTIAL DRIFT DETECTED{COLOR_RESET}")
-        print(f"  • Run 'workbuddy sandbox heal' to refresh in-memory Seatbelt rules.")
-        print(f"  • If an upstream update ever conflicts or breaks IPC, safely roll back with:")
+        print("  • Run 'workbuddy sandbox heal' to refresh in-memory Seatbelt rules.")
+        print("  • If an upstream update ever conflicts or breaks IPC, safely roll back with:")
         print(f"    {COLOR_BOLD}python3 uninstall.py{COLOR_RESET} (or bash uninstall.sh / uninstall.ps1)")
-        print(f"  • Upstream compatibility tracker: https://github.com/FlapPearLabs/workbuddy-toolkit\n")
+        print("  • Upstream compatibility tracker: https://github.com/FlapPearLabs/workbuddy-toolkit\n")
     else:
         print(f"Conflict Status       : {COLOR_GREEN}ZERO CONFLICTS DETECTED (Idempotent rules & passive monitoring){COLOR_RESET}")
-        print(f"Rollback Instruction  : Safe 0-residue rollback available anytime via: python3 uninstall.py\n")
+        print("Rollback Instruction  : Safe 0-residue rollback available anytime via: python3 uninstall.py\n")
 
     return is_compatible
 
@@ -3630,10 +3824,10 @@ def run_router_cmd(args):
                     cd_str = ", ".join([f"{k} (剩 {v}s)" for k, v in cooldowns.items()])
                     print(f"冷却中模型 : {COLOR_YELLOW}{cd_str}{COLOR_RESET}")
                 else:
-                    print(f"冷却中模型 : 无 (所有候选均健康就绪)")
+                    print("冷却中模型 : 无 (所有候选均健康就绪)")
         except Exception:
             print(f"网关服务   : {COLOR_RED}未运行 (OFFLINE){COLOR_RESET}")
-            print(f"提示: 可使用 'workbuddy router start' 启动，或配置 LaunchAgent 常驻运行。")
+            print("提示: 可使用 'workbuddy router start' 启动，或配置 LaunchAgent 常驻运行。")
         print()
     elif action == "start":
         try:
@@ -3658,15 +3852,15 @@ def run_router_cmd(args):
         plist_path = os.path.expanduser("~/Library/LaunchAgents/com.workbuddy.failover-router.plist")
         if os.path.exists(plist_path):
             subprocess.run(["launchctl", "unload", plist_path], capture_output=True)
-        subprocess.run(["pkill", "-f", "router_engine.py"], capture_output=True)
-        subprocess.run(["pkill", "-f", "failover-router"], capture_output=True)
+        if sys.platform != "win32":
+            subprocess.run(["pkill", "-f", "sidecar/router_engine.py"], capture_output=True)
         print(f"{COLOR_GREEN}✔ Failover Router 服务已停止。{COLOR_RESET}")
     elif action == "restart":
         run_router_cmd(["stop"])
         time.sleep(0.5)
         run_router_cmd(["start"])
     else:
-        print(f"用法: workbuddy router [status|start|stop|restart]")
+        print("用法: workbuddy router [status|start|stop|restart]")
 
 def get_log_guard_module():
     import importlib.util
@@ -3781,15 +3975,15 @@ def run_sandbox_cmd(args):
         if reap_res.get("reaped"):
             print(f"{COLOR_GREEN}✔ 已终止孤儿守护进程 PIDs: {reap_res.get('pids')}{COLOR_RESET}")
         elif reap_res.get("reason") == "gui_running":
-            print(f"  (WorkBuddy GUI 运行中，跳过孤儿进程回收)")
+            print("  (WorkBuddy GUI 运行中，跳过孤儿进程回收)")
         elif reap_res.get("reason") == "user_workload_active":
-            print(f"  (检测到用户活跃进程，跳过守护进程回收以保护工作现场)")
+            print("  (检测到用户活跃进程，跳过守护进程回收以保护工作现场)")
         elif reap_res.get("reason") == "sandbox_cli_active":
-            print(f"  (检测到沙盒中存在活跃任务，跳过守护进程回收)")
+            print("  (检测到沙盒中存在活跃任务，跳过守护进程回收)")
         print()
 
     else:
-        print(f"用法: workbuddy sandbox [status|heal|clean] [--json] (别名: wb-sandbox)")
+        print("用法: workbuddy sandbox [status|heal|clean] [--json] (别名: wb-sandbox)")
 
 def run_usage_cmd(args):
     """调用积分消耗与流速统计引擎 (wb-usage)"""
@@ -4070,8 +4264,10 @@ def main():
         print_help()
     else:
         profiles = get_profiles()
-        if cmd in profiles or any(p["nickname"].lower() == cmd for p in profiles.values()):
-            switch_to_profile(cmd, auto_restart=True)
+        # `workbuddy <别名|昵称>` 快捷切换：只接受精确匹配，避免拼错的命令被当成 UID 前缀切号
+        shortcut_name, _ = resolve_profile_target(profiles, args[0], allow_uid_prefix=False, quiet=True)
+        if shortcut_name:
+            switch_to_profile(shortcut_name, auto_restart=True)
         else:
             print(f"{COLOR_RED}未知命令或账号: {cmd}{COLOR_RESET}")
             print_help()

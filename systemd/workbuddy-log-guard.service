@@ -1,0 +1,11 @@
+[Unit]
+Description=WorkBuddy Toolkit Log Guard (log / sandbox snapshot lifecycle)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'exec "$HOME/.local/bin/workbuddy-log-guard" >> "$HOME/.workbuddy/logs/log-guard.log" 2>&1'
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

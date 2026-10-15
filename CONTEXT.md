@@ -13,7 +13,7 @@ The total credit consumption divided by the total duration of the specified quer
 _Avoid_: Flat rate, coarse speed
 
 **Active Burn Rate**:
-The credit consumption divided by active inference duration (excluding idle periods between requests), representing actual load velocity during generations.
+An *estimate* of credit consumption per second of active generation. WorkBuddy's `session_usage` records per-turn deductions but not inference duration, so the meter assumes a fixed `ASSUMED_SECONDS_PER_TURN` (10 s) per billing turn: `credits / (turns × 10 s)`. JSON output marks it with `burn_rate_is_estimate: true`; the TTY card labels it 估算流速.
 _Avoid_: Peak rate, burst speed
 
 **Instantaneous Burn Rate**:

@@ -29,6 +29,19 @@ cd $HOME\.workbuddy\toolkit
 python install.py
 ```
 
+默认只安装命令行工具与 sidecar 模块：**不修改 WorkBuddy 数据库，也不注册任何后台任务**。在交互式终端中，安装程序会逐项询问下面这些可选能力（直接回车 = 否）；也可以用参数显式开启：
+
+| 参数 | 作用 |
+|---|---|
+| `--init-workspace` | 开启多账号工作区共享（等同 `workbuddy init`，可用 `workbuddy rollback` 恢复） |
+| `--with-checkin` | 注册每日 09:00 自动签到（会给每个已保存账号发送一次保活对话） |
+| `--with-log-guard` | 注册日志 / 沙盒看门狗（每 30 分钟） |
+| `--with-router` | 注册容灾路由常驻服务 127.0.0.1:8047（仅 macOS LaunchAgent） |
+| `--with-services` | 以上三项后台任务全部开启 |
+| `--no-input` | 不询问，未显式开启的一律跳过（CI / Agent 场景） |
+
+`install.py` 与 `install.sh` 支持相同的参数。仓库 clone 在 `~/.workbuddy/toolkit` 或其他任意位置均可。
+
 ### 系统原生安装脚本
 
 macOS / Linux：
@@ -57,7 +70,7 @@ workbuddy status
 
 这三步分别用于：
 
-1. 初始化 Toolkit 需要的本地结构与工作区共享机制。
+1. 开启多账号工作区共享：会话原始归属会先备份到数据库旁路表，随时可用 `workbuddy rollback` 逐个恢复。
 2. 检查当前 WorkBuddy 版本、凭据格式和本地运行时兼容性。
 3. 查看当前账号与已保存账号配置的状态。
 
@@ -99,13 +112,13 @@ wb-checkin
 wb-audit
 ```
 
-安装程序可按系统配置原生后台调度：
+后台调度默认不开启。需要时重新运行安装程序并加上 `--with-checkin` / `--with-log-guard`，会按系统接入原生调度：
 
 - macOS：`launchd`
 - Linux：`systemd --user`，必要时降级到 `cron`
 - Windows：任务计划程序
 
-如果你不希望后台自动运行，可以关闭系统调度，保留手动命令。
+> 自动签到与保活对话会以客户端身份批量访问 WorkBuddy 服务。多账号自动化可能触发平台风控或违反服务条款，请自行评估后再开启。
 
 ## 6. 让 AI 编程 Agent 帮你安装
 
@@ -115,11 +128,11 @@ wb-audit
 请帮我安装并验证 WorkBuddy Toolkit：
 
 1. 克隆 https://github.com/FlapPearLabs/workbuddy-toolkit.git 到 ~/.workbuddy/toolkit。
-2. 根据当前操作系统运行 install.py；如果 Python 命令不同，请自行适配。
+2. 根据当前操作系统运行 `install.py --no-input`；如果 Python 命令不同，请自行适配。
 3. 依次运行 workbuddy init、workbuddy doctor、workbuddy status。
 4. 不要修改 WorkBuddy 应用包本体。
 5. 如果 doctor 报告不兼容，停止后续写操作并告诉我具体诊断结果。
-6. 如果环境支持任务调度，再询问我是否启用每日 wb-checkin；不要擅自创建我没有确认的后台任务。
+6. 如果环境支持任务调度，再询问我是否启用每日 wb-checkin；我确认后再运行 `install.py --with-checkin`，不要擅自创建我没有确认的后台任务。
 7. 最后汇报：安装位置、doctor 结果、当前账号状态、后台调度是否启用。
 ```
 
@@ -152,7 +165,13 @@ wb-doctor     兼容性与故障诊断
 python3 uninstall.py
 ```
 
-或使用对应平台的卸载脚本。卸载前如果你依赖自动签到或后台健康巡检，请先确认这些任务不再需要。
+或使用对应平台的卸载脚本。卸载会：
+
+- 注销 Toolkit 注册的所有后台任务；
+- 还原 `wb-models` 改写过的 `~/.workbuddy/models.json` 条目（否则这些模型会指向已停止的 127.0.0.1:8047）；
+- 询问是否回滚工作区共享，并按备份恢复每个会话与自动化任务的原始账号归属（`--yes` / `--no-rollback`）；
+- 删除 Toolkit 自己的配置与日志（`--keep-config` 可保留）；
+- **保留** `~/.workbuddy/auth_profiles/` 中的账号凭证，以及 clone 在 `~/.workbuddy/toolkit` 的源码仓库。
 
 ## 下一步
 

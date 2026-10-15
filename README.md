@@ -2,7 +2,7 @@
 
 [![CI: Cross-Platform Matrix](https://github.com/FlapPearLabs/workbuddy-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit/actions/workflows/ci.yml)
 [![Release: v0.7.0](https://img.shields.io/badge/Release-v0.7.0-blue.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit)
-[![Tests: 152/152 Passed](https://img.shields.io/badge/Tests-152%2F152%20Passed-brightgreen.svg)](tests/)
+[![Tests: 200/200 Passed](https://img.shields.io/badge/Tests-200%2F200%20Passed-brightgreen.svg)](tests/)
 [![Security: Zero-Leak](https://img.shields.io/badge/Security-Zero--Leak%20Audit%20Passed-success.svg)](.github/workflows/ci.yml)
 [![Platform: macOS | Linux | Windows](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-brightgreen.svg)](https://github.com/FlapPearLabs/workbuddy-toolkit)
 [![Python: 3.8+](https://img.shields.io/badge/Python-3.8+-green.svg)](https://python.org)
@@ -70,6 +70,8 @@ macOS / Linux   ./install.sh
 Windows         .\install.ps1
 ```
 
+默认只安装命令行工具，**不改数据库、不注册后台任务**。交互式终端中会逐项询问可选能力；也可用 `--init-workspace`、`--with-checkin`、`--with-log-guard`、`--with-router`、`--with-services`、`--no-input` 显式指定，详见 [入门指南](docs/getting-started.md#2-推荐安装方式)。
+
 ### 2. 初始化并检查环境
 
 ```bash
@@ -106,11 +108,11 @@ wb-audit
 请帮我安装并验证 WorkBuddy Toolkit：
 
 1. 克隆 https://github.com/FlapPearLabs/workbuddy-toolkit.git 到 ~/.workbuddy/toolkit。
-2. 根据当前操作系统运行 install.py；如果 Python 命令不同，请自行适配。
+2. 根据当前操作系统运行 `install.py --no-input`；如果 Python 命令不同，请自行适配。
 3. 依次运行 workbuddy init、workbuddy doctor、workbuddy status。
 4. 不要修改 WorkBuddy 应用包本体。
 5. 如果 doctor 报告不兼容，停止后续写操作并告诉我具体诊断结果。
-6. 如果环境支持任务调度，再询问我是否启用每日 wb-checkin；不要擅自创建我没有确认的后台任务。
+6. 如果环境支持任务调度，再询问我是否启用每日 wb-checkin；我确认后再运行 `install.py --with-checkin`，不要擅自创建我没有确认的后台任务。
 7. 最后汇报安装位置、doctor 结果、当前账号状态和后台调度状态。
 ```
 
@@ -167,13 +169,13 @@ wb-checkin    每日签到与连续任务
 wb-usage      积分消耗与流速统计
 ```
 
-安装程序可以接入系统原生调度：
+后台任务默认不开启。需要时用 `install.py --with-checkin` 接入系统原生调度：
 
 - macOS：`launchd`
 - Linux：`systemd --user`，必要时降级到 `cron`
 - Windows：任务计划程序
 
-如果你不需要后台任务，可以只保留手动命令。
+> 多账号自动签到与保活对话会以客户端身份批量访问 WorkBuddy 服务，可能触发平台风控或违反服务条款，请自行评估。
 
 ### 开发者工具
 
@@ -351,20 +353,21 @@ workbuddy doctor
 
 Toolkit 的安全边界比“功能更多”更重要：
 
-- 账号配置保留在本机；
-- 加密凭据兼容不等于建立明文凭据仓库；
-- 状态替换优先采用临时文件 / 原子替换思路；
-- 后台维护任务有明确边界，不应无限等待或无限增长；
+- 账号配置保留在本机，所有凭据文件以 0600 原子写入；
+- 加密凭据兼容不等于建立明文凭据仓库：无法加密时会明确告警，`doctor` 会列出明文保存的账号；
+- 仓库不内置任何第三方 API Key，CI 与单元测试都会做 Zero-Leak 扫描；
+- 容灾路由只监听 127.0.0.1，并要求每台机器独立生成的 Token（`~/.workbuddy/router_token`）；
+- 后台任务默认关闭，开启后也有明确边界，不应无限等待或无限增长；
 - 上游不兼容时应暴露诊断，而不是静默继续；
-- 安装是可回退的。
+- 安装是可回退的：会话 / 自动化任务的原始归属与 models.json 原值都会先备份，回滚与卸载据此恢复。
 
 卸载：
 
 ```bash
-python3 uninstall.py
+python3 uninstall.py            # 交互式；--yes 同时回滚工作区共享，--keep-config 保留配置
 ```
 
-也可以使用对应平台的卸载脚本。
+也可以使用对应平台的卸载脚本。卸载会注销后台任务、还原 models.json、按备份恢复会话归属，并保留账号凭证与 `~/.workbuddy/toolkit` 下的源码仓库。
 
 如果你正在排查升级后的兼容问题，先运行 `wb-doctor`，再决定是否卸载。
 

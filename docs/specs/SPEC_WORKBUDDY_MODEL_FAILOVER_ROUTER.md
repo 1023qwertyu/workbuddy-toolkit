@@ -115,7 +115,7 @@ A cohesive two-tier system consisting of an **Interactive Terminal Control Plane
     "name": "Auto Pilot (自动容灾轮换池)",
     "vendor": "FailoverRouter",
     "url": "http://127.0.0.1:8047/v1",
-    "apiKey": "sk-workbuddy-router-local",
+    "apiKey": "<contents of ~/.workbuddy/router_token>",
     "supportsToolCall": true,
     "supportsImages": true,
     "supportsReasoning": true,
@@ -137,7 +137,14 @@ $$\text{Score} = w_{\text{usage}} \cdot \log(1 + \text{count}) + w_{\text{cost}}
 - When receiving a request for `workbuddy-autopilot`, the router identifies the first non-cooldown candidate in the chain.
 - If the candidate is an official model, requests route via WorkBuddy's internal credentials/endpoint; if custom, via the URL/key specified in `models.json`.
 - The router peeks at initial response bytes:
-  - If HTTP 429, 401, 403, 5xx, or initial timeout elapses before the first token: the candidate enters cooldown, a desktop notification is dispatched, and the request re-dispatches to the next candidate.
+  - If HTTP 429, 401, 403, 408, 5xx, or initial timeout elapses before the first token: the candidate enters cooldown, a desktop notification is dispatched, and the request re-dispatches to the next candidate.
+  - If HTTP 400, 413, 415 or 422 (the caller's own request was rejected): the candidate does **not** enter cooldown. The next candidate is still tried; if every candidate only returned client errors, the last upstream 4xx status and body are returned to the caller instead of a synthetic 503.
+
+### Access Control
+- The router binds to `127.0.0.1` only and rejects requests whose `Host` header is not a loopback name (DNS-rebinding defense).
+- `POST /v1/chat/completions` requires `Authorization: Bearer <token>` (or `X-Api-Key`), where the token is generated per install at `~/.workbuddy/router_token` (mode 0600). The router injects the active account's credentials for official models, so unauthenticated access would let any local process or web page spend the user's credits.
+- Request bodies must be `application/json` (415 otherwise) and at most 64 MiB (413 otherwise).
+- `wb-models` writes the token into `models.json`; on startup the router upgrades entries that still carry the legacy public placeholder `sk-workbuddy-router-local`.
   - Once the first valid token chunk arrives, the router switches to transparent streaming pass-through.
 
 ---

@@ -14,6 +14,9 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "sidecar")))
 import router_engine
 
+ROUTER_TOKEN = "test-router-token-0123456789"
+AUTH_HEADERS = {"Content-Type": "application/json", "Authorization": f"Bearer {ROUTER_TOKEN}"}
+
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0))
@@ -51,6 +54,16 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"error":{"message":"Rate limit exceeded","code":429}}')
+
+        elif mode == "bad_request_400":
+            # 单线程 mock 中可能积压着早前已超时客户端的连接，写入时对端已关闭属正常现象
+            try:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":{"message":"messages must be an array","code":400}}')
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         elif mode == "server_error_503":
             self.send_response(503)
@@ -96,6 +109,7 @@ class TestFailoverRouter(unittest.TestCase):
             "enabled": True,
             "port": cls.router_port,
             "cooldown_seconds": 2,  # 2 seconds cooldown for test
+            "auth_token": ROUTER_TOKEN,
             "fast_model_timeout_seconds": 0.3,
             "thinking_model_timeout_seconds": 0.5,
             "chain": [
@@ -136,7 +150,7 @@ class TestFailoverRouter(unittest.TestCase):
             "stream": True
         }).encode("utf-8")
 
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(url, data=payload, headers=AUTH_HEADERS)
         with urllib.request.urlopen(req, timeout=5) as resp:
             self.assertEqual(resp.status, 200)
             raw_body = resp.read().decode("utf-8")
@@ -159,7 +173,7 @@ class TestFailoverRouter(unittest.TestCase):
             "stream": True
         }).encode("utf-8")
 
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(url, data=payload, headers=AUTH_HEADERS)
         start_time = time.time()
         with urllib.request.urlopen(req, timeout=5) as resp:
             self.assertEqual(resp.status, 200)
@@ -186,7 +200,7 @@ class TestFailoverRouter(unittest.TestCase):
             "stream": True
         }).encode("utf-8")
 
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(url, data=payload, headers=AUTH_HEADERS)
         with urllib.request.urlopen(req, timeout=5) as resp:
             self.assertEqual(resp.status, 200)
             raw_body = resp.read().decode("utf-8")
@@ -207,7 +221,7 @@ class TestFailoverRouter(unittest.TestCase):
             "stream": True
         }).encode("utf-8")
 
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(url, data=payload, headers=AUTH_HEADERS)
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 self.fail("Expected HTTPError 503")
@@ -230,7 +244,7 @@ class TestFailoverRouter(unittest.TestCase):
             "stream": True
         }).encode("utf-8")
 
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(url, data=payload, headers=AUTH_HEADERS)
         with urllib.request.urlopen(req, timeout=5) as resp:
             self.assertEqual(resp.status, 200)
             self.assertEqual(resp.headers.get("X-WorkBuddy-Routed-Model"), "model-secondary")
@@ -286,7 +300,7 @@ class TestFailoverRouter(unittest.TestCase):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect(('127.0.0.1', self.router_port))
         req_body = json.dumps({'model': 'model-primary', 'stream': True, 'messages': [{'role': 'user', 'content': 'hi'}]})
-        req_data = f'POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {len(req_body)}\r\nContent-Type: application/json\r\n\r\n{req_body}'.encode()
+        req_data = f'POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {len(req_body)}\r\nContent-Type: application/json\r\nAuthorization: Bearer {ROUTER_TOKEN}\r\n\r\n{req_body}'.encode()
         sock.sendall(req_data)
 
         response_bytes = b''
@@ -306,6 +320,133 @@ class TestFailoverRouter(unittest.TestCase):
         # 绝不能出现多个 HTTP/1.0 200 或在已提交流中拼接 503
         self.assertLessEqual(resp_str.count("HTTP/1.0 200 OK"), 1)
         self.assertNotIn("HTTP/1.0 503", resp_str)
+
+    # ------------------------------------------------------------------
+    # 安全与错误分类回归
+    # ------------------------------------------------------------------
+    def _post(self, payload, headers, host=None):
+        url = f"http://127.0.0.1:{self.router_port}/v1/chat/completions"
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+        if host:
+            req.add_unredirected_header("Host", host)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def test_08_requests_without_token_are_rejected(self):
+        payload = {"model": "workbuddy-autopilot", "stream": False, "messages": [{"role": "user", "content": "hi"}]}
+        self.assertEqual(self._post(payload, {"Content-Type": "application/json"})[0], 401)
+        self.assertEqual(self._post(payload, {"Content-Type": "application/json", "Authorization": "Bearer wrong"})[0], 401)
+        # 旧版公开占位 Key 不得再被接受
+        self.assertEqual(self._post(payload, {"Content-Type": "application/json",
+                                              "Authorization": f"Bearer {router_engine.LEGACY_LOCAL_KEY}"})[0], 401)
+
+    def test_09_cross_site_simple_request_is_rejected(self):
+        payload = {"model": "workbuddy-autopilot", "stream": False, "messages": [{"role": "user", "content": "hi"}]}
+        # 浏览器跨站"简单请求"只能用 text/plain 等类型，且无法附带 Authorization
+        self.assertIn(self._post(payload, {"Content-Type": "text/plain"})[0], (401, 415))
+        self.assertEqual(self._post(payload, {"Content-Type": "text/plain", "Authorization": f"Bearer {ROUTER_TOKEN}"})[0], 415)
+
+    def test_10_dns_rebinding_host_is_rejected(self):
+        payload = {"model": "workbuddy-autopilot", "stream": False, "messages": [{"role": "user", "content": "hi"}]}
+        self.assertEqual(self._post(payload, AUTH_HEADERS, host=f"evil.example:{self.router_port}")[0], 403)
+        req = urllib.request.Request(f"http://127.0.0.1:{self.router_port}/status")
+        req.add_unredirected_header("Host", "evil.example")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(ctx.exception.code, 403)
+
+    def test_11_client_error_does_not_cool_down_chain(self):
+        # 使用独立的上游与路由：共享的单线程 mock 里可能还挂着前面用例的 hang 请求，
+        # 那会让本用例的首包超时（真实上游故障）并返回 503，从而掩盖要验证的 4xx 语义。
+        up_a, up_b = MockServer(mode="bad_request_400"), MockServer(mode="bad_request_400")
+        port = find_free_port()
+        router = router_engine.FailoverRouterServer({
+            "port": port, "cooldown_seconds": 60, "auth_token": ROUTER_TOKEN,
+            "fast_model_timeout_seconds": 3, "thinking_model_timeout_seconds": 3,
+            "chain": [
+                {"id": "iso-a", "url": f"http://127.0.0.1:{up_a.port}/v1/chat/completions"},
+                {"id": "iso-b", "url": f"http://127.0.0.1:{up_b.port}/v1/chat/completions"},
+            ],
+        }, config_path=None)
+        router.start(port=port)
+        time.sleep(0.1)
+
+        def post(payload):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
+                                         data=json.dumps(payload).encode("utf-8"), headers=AUTH_HEADERS)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return resp.status, resp.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+
+        try:
+            bad = {"model": "workbuddy-autopilot", "stream": True, "messages": "not-an-array"}
+            code, body = post(bad)
+            self.assertEqual(code, 400, "调用方请求错误应原样返回 4xx，而不是 503")
+            self.assertIn(b"messages must be an array", body)
+            self.assertFalse(router.is_in_cooldown("iso-a"))
+            self.assertFalse(router.is_in_cooldown("iso-b"))
+
+            # 紧接着的正常请求必须成功
+            up_a.set_mode("success_stream")
+            good = {"model": "workbuddy-autopilot", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            code, body = post(good)
+            self.assertEqual(code, 200)
+            self.assertIn(b"Hello", body)
+        finally:
+            router.stop()
+            up_a.stop()
+            up_b.stop()
+
+    def test_12_oversized_body_is_rejected(self):
+        s = socket.create_connection(("127.0.0.1", self.router_port), timeout=3)
+        try:
+            s.sendall((f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                       f"Authorization: Bearer {ROUTER_TOKEN}\r\nContent-Type: application/json\r\n"
+                       f"Content-Length: {router_engine.MAX_REQUEST_BODY + 1}\r\n\r\n").encode())
+            data = s.recv(4096).decode("utf-8", errors="replace")
+        finally:
+            s.close()
+        self.assertIn(" 413 ", data.splitlines()[0])
+
+
+class TestRouterToken(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_token_is_random_persistent_and_private(self):
+        path = os.path.join(self.tmp, "router_token")
+        t1 = router_engine.load_or_create_router_token(path)
+        t2 = router_engine.load_or_create_router_token(path)
+        self.assertEqual(t1, t2)
+        self.assertGreaterEqual(len(t1), 32)
+        self.assertNotEqual(t1, router_engine.LEGACY_LOCAL_KEY)
+        if os.name != "nt":
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        other = router_engine.load_or_create_router_token(os.path.join(self.tmp, "other_token"))
+        self.assertNotEqual(t1, other)
+
+    def test_models_json_legacy_key_migration(self):
+        mj = os.path.join(self.tmp, "models.json")
+        with open(mj, "w", encoding="utf-8") as f:
+            json.dump([
+                {"id": "workbuddy-autopilot", "url": "http://127.0.0.1:8047/v1", "apiKey": router_engine.LEGACY_LOCAL_KEY},
+                {"id": "user-model", "url": "https://api.example.com/v1", "apiKey": "user-own-key"},
+            ], f)
+        n = router_engine.migrate_models_json_token("new-token", port=8047, models_json_path=mj)
+        self.assertEqual(n, 1)
+        with open(mj, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data[0]["apiKey"], "new-token")
+        self.assertEqual(data[1]["apiKey"], "user-own-key", "用户自己的上游 Key 不得被改动")
 
 if __name__ == "__main__":
     unittest.main()

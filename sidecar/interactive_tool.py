@@ -12,11 +12,11 @@ WorkBuddy 交互式控制中心 (wb-tool / workbuddy-tool)
 
 import os
 import sys
-import time
 import unicodedata
 from typing import Dict, Any, List, Optional, Tuple
 
-HAS_COLOR = sys.platform != "win32" or "WT_SESSION" in os.environ or os.environ.get("TERM_PROGRAM") or sys.stdout.isatty()
+# 只在交互式终端输出 ANSI 颜色；管道、cron/launchd 日志与 NO_COLOR 环境下输出纯文本
+HAS_COLOR = bool(getattr(sys.stdout, "isatty", lambda: False)()) and "NO_COLOR" not in os.environ
 COLOR_GREEN = "\033[92m" if HAS_COLOR else ""
 COLOR_YELLOW = "\033[93m" if HAS_COLOR else ""
 COLOR_CYAN = "\033[96m" if HAS_COLOR else ""
@@ -478,7 +478,7 @@ class InteractiveToolController:
             is_cur = (p.get("uid") == active_uid)
             cur_mark = f" {COLOR_GREEN}(当前使用中){COLOR_RESET}" if is_cur else ""
             print(f"  [{idx}] {name:<12} (昵称: {p.get('nickname')}){cur_mark}")
-        print(f"  [0] 返回上级")
+        print("  [0] 返回上级")
 
         try:
             choice = input(f"{COLOR_BOLD}请输入账号序号 [1-{len(keys)}]: {COLOR_RESET}").strip()
@@ -520,7 +520,7 @@ class InteractiveToolController:
 
         line1 = f"  本次操作记录: 共完成 {act_count} 项操作"
         line2 = f"  当前生效账号: {info['active_name']}"
-        line3 = f"  工具状态    : 已安全退出"
+        line3 = "  工具状态    : 已安全退出"
 
         print(f"\n{COLOR_CYAN}{top_border}{COLOR_RESET}")
         print(f"│{pad_to_width(line1, total_width - 2)}│")

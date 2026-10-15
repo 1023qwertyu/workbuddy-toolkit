@@ -40,7 +40,7 @@ class TestInstallersE2E(unittest.TestCase):
         uninstaller = os.path.join(REPO_DIR, "uninstall.py")
 
         # 1. 运行安装器
-        res = subprocess.run([sys.executable, installer], cwd=REPO_DIR, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        res = subprocess.run([sys.executable, installer, "--no-input"], cwd=REPO_DIR, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertEqual(res.returncode, 0, f"install.py 失败: {res.stderr}\n{res.stdout}")
         self.assertIn("安装部署全部完成", res.stdout)
 
@@ -124,6 +124,77 @@ class TestInstallersE2E(unittest.TestCase):
         # 验证 ~/.workbuddy/toolkit 伴随组件目录已物理 100% 移除
         toolkit_path = os.path.join(self.temp_home, ".workbuddy", "toolkit")
         self.assertFalse(os.path.exists(toolkit_path))
+
+
+def _copy_repo(dest):
+    shutil.copytree(REPO_DIR, dest, ignore=shutil.ignore_patterns(".git", "__pycache__", ".ruff_cache"))
+    return dest
+
+
+class TestInstallerLayouts(unittest.TestCase):
+    """覆盖 README 推荐的真实安装位置：仓库直接 clone 在 ~/.workbuddy/toolkit。"""
+
+    def setUp(self):
+        self.temp_home = tempfile.mkdtemp()
+        self.env = os.environ.copy()
+        self.env.update({
+            "HOME": self.temp_home,
+            "USERPROFILE": self.temp_home,
+            "APPDATA": os.path.join(self.temp_home, "AppData", "Roaming"),
+            "LOCALAPPDATA": os.path.join(self.temp_home, "AppData", "Local"),
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+        })
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_home, ignore_errors=True)
+
+    def _sidecar_files(self, root):
+        return sorted(f for f in os.listdir(os.path.join(root, "sidecar")) if not f.startswith("__"))
+
+    def test_install_py_from_recommended_clone_location_keeps_sidecar(self):
+        clone = _copy_repo(os.path.join(self.temp_home, ".workbuddy", "toolkit"))
+        before = self._sidecar_files(clone)
+        res = subprocess.run([sys.executable, os.path.join(clone, "install.py"), "--no-input"],
+                             cwd=clone, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+        self.assertIn("安装部署全部完成", res.stdout)
+        self.assertEqual(self._sidecar_files(clone), before, "安装器不得删除仓库自身的 sidecar 源码")
+
+    def test_install_py_registers_no_background_services_by_default(self):
+        res = subprocess.run([sys.executable, os.path.join(REPO_DIR, "install.py"), "--no-input"],
+                             cwd=REPO_DIR, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+        launch_dir = os.path.join(self.temp_home, "Library", "LaunchAgents")
+        self.assertFalse(os.path.isdir(launch_dir) and any(f.startswith("com.workbuddy.") for f in os.listdir(launch_dir)))
+        systemd_dir = os.path.join(self.temp_home, ".config", "systemd", "user")
+        self.assertFalse(os.path.isdir(systemd_dir) and any(f.startswith("workbuddy-") for f in os.listdir(systemd_dir)))
+        self.assertFalse(os.path.exists(os.path.join(self.temp_home, ".gemini", "config", "sidecars", "workbuddy-checkin")))
+        self.assertIn("未注册任何后台任务", res.stdout)
+
+    @unittest.skipIf(sys.platform == "win32", "install.sh 仅用于 macOS / Linux")
+    def test_install_sh_deploys_sidecar_for_any_clone_location(self):
+        clone = _copy_repo(os.path.join(self.temp_home, "src", "workbuddy-toolkit"))
+        res = subprocess.run(["bash", os.path.join(clone, "install.sh"), "--no-input"],
+                             cwd=clone, env=self.env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+        deployed = os.path.join(self.temp_home, ".workbuddy", "toolkit", "sidecar", "credit_meter.py")
+        self.assertTrue(os.path.exists(deployed), "install.sh 必须部署 sidecar 模块")
+        usage = subprocess.run([sys.executable, os.path.join(self.temp_home, ".local", "bin", "wb-usage"), "--help"],
+                               env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(usage.returncode, 0, usage.stderr)
+
+    @unittest.skipIf(sys.platform == "win32", "install.sh 仅用于 macOS / Linux")
+    def test_install_sh_from_recommended_clone_location_keeps_sidecar(self):
+        clone = _copy_repo(os.path.join(self.temp_home, ".workbuddy", "toolkit"))
+        before = self._sidecar_files(clone)
+        res = subprocess.run(["bash", os.path.join(clone, "install.sh"), "--no-input"],
+                             cwd=clone, env=self.env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+        self.assertEqual(self._sidecar_files(clone), before)
+
 
 if __name__ == "__main__":
     unittest.main()

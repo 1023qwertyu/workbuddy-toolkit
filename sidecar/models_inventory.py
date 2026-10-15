@@ -5,11 +5,13 @@ WorkBuddy 模型全景资产库、倍率解析、使用统计与智能排序选�
 """
 
 import os
-import sys
 import re
+import copy
 import json
 import math
+import time
 import sqlite3
+import tempfile
 from typing import List, Dict, Any, Optional
 
 DEFAULT_WORKBUDDY_DIR = os.path.expanduser("~/.workbuddy")
@@ -30,6 +32,36 @@ COLOR_BLUE = "\033[34m"
 COLOR_CYAN = "\033[36m"
 COLOR_RED = "\033[31m"
 COLOR_GRAY = "\033[90m"
+
+def atomic_write_json(path: str, data: Any, mode: Optional[int] = 0o600) -> None:
+    """原子写入 JSON：同目录临时文件 + fsync + os.replace，避免半写入损坏配置。
+
+    mode=None 时沿用目标文件已有权限（用于 WorkBuddy 自己的 models.json）；
+    否则以指定权限创建（含 API Key 的路由配置默认 0600）。
+    """
+    target_dir = os.path.dirname(os.path.abspath(path))
+    os.makedirs(target_dir, exist_ok=True)
+    if mode is None:
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except OSError:
+            mode = 0o644
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=target_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name != "nt":
+            os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
 
 def find_latest_dynamic_product_config(
     spill_dir: str = DEFAULT_SPILL_DIR,
@@ -295,6 +327,9 @@ def load_failover_config(config_path: str = DEFAULT_ROUTER_CONFIG) -> Dict[str, 
         "chain": []
     }
 
+# 内置上游路由表只保存端点元数据，绝不内置任何 API Key。
+# 自定义模型的真实凭据来自用户本机 ~/.workbuddy/models.json（经 get_unified_inventory 合并），
+# 或用户已有的 ~/.workbuddy/failover_router.json，均只存在于用户本地。
 DEFAULT_UPSTREAMS = {
     "space-bunny-free": {
         "id": "space-bunny-free",
@@ -302,7 +337,7 @@ DEFAULT_UPSTREAMS = {
         "source": "custom",
         "vendor": "OpenCode Zen",
         "url": "https://opencode.ai/zen/v1/chat/completions",
-        "apiKey": "sk-fWTpWfNqsiknArM9R14Muk72U1DqAMavnZLv0fcysZoLt34EMKRXUqmt4g9TVhbL",
+        "apiKey": "",
         "supportsToolCall": True,
         "supportsReasoning": True,
         "supportsImages": True
@@ -313,7 +348,7 @@ DEFAULT_UPSTREAMS = {
         "source": "custom",
         "vendor": "OpenCode Zen",
         "url": "https://opencode.ai/zen/v1/chat/completions",
-        "apiKey": "sk-fWTpWfNqsiknArM9R14Muk72U1DqAMavnZLv0fcysZoLt34EMKRXUqmt4g9TVhbL",
+        "apiKey": "",
         "supportsToolCall": True,
         "supportsReasoning": True,
         "supportsImages": False
@@ -368,7 +403,7 @@ DEFAULT_UPSTREAMS = {
         "source": "custom",
         "vendor": "Google",
         "url": "http://127.0.0.1:8045/v1",
-        "apiKey": "sk-8246df449d384693a498cb627b26432c",
+        "apiKey": "",
         "supportsToolCall": True,
         "supportsReasoning": True,
         "supportsImages": True
@@ -379,7 +414,7 @@ DEFAULT_UPSTREAMS = {
         "source": "custom",
         "vendor": "Google",
         "url": "http://127.0.0.1:8045/v1",
-        "apiKey": "sk-8246df449d384693a498cb627b26432c",
+        "apiKey": "",
         "supportsToolCall": True,
         "supportsReasoning": True,
         "supportsImages": True
@@ -390,7 +425,7 @@ DEFAULT_UPSTREAMS = {
         "source": "custom",
         "vendor": "Anthropic",
         "url": "http://127.0.0.1:8045/v1",
-        "apiKey": "sk-8246df449d384693a498cb627b26432c",
+        "apiKey": "",
         "supportsToolCall": True,
         "supportsReasoning": True,
         "supportsImages": True
@@ -401,7 +436,7 @@ DEFAULT_UPSTREAMS = {
         "source": "custom",
         "vendor": "Anthropic",
         "url": "http://127.0.0.1:8045/v1",
-        "apiKey": "sk-8246df449d384693a498cb627b26432c",
+        "apiKey": "",
         "supportsToolCall": True,
         "supportsReasoning": False,
         "supportsImages": True
@@ -484,13 +519,109 @@ def save_failover_config(
         "upstreams": upstreams
     }
 
-    os.makedirs(os.path.dirname(os.path.abspath(config_path)), exist_ok=True)
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    # 配置中可能包含用户自定义上游的 API Key，必须以 0600 原子写入
+    atomic_write_json(config_path, cfg, mode=0o600)
+
+# register_virtual_model_in_models_json 会改写的条目；首次改写前备份原值，卸载时据此还原
+MANAGED_MODEL_IDS = ("workbuddy-autopilot", "deepseek-v4.1-flash", "space-bunny-free")
+
+def _default_models_backup_path(models_json_path: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(models_json_path)), "toolkit-state", "models_json_backup.json")
+
+def _points_at_local_router(entry: Dict[str, Any], port: int) -> bool:
+    url = str(entry.get("url") or "")
+    return any(f"{h}:{port}" in url for h in ("127.0.0.1", "localhost", "[::1]"))
+
+def _backup_managed_entries(current_list: List[Any], backup_path: str, port: int) -> None:
+    """只在第一次接管时备份，保证记录的是 Toolkit 介入之前的原始状态。"""
+    if os.path.exists(backup_path):
+        return
+    entries: Dict[str, Any] = {}
+    for mid in MANAGED_MODEL_IDS:
+        orig = next((m for m in current_list if isinstance(m, dict) and m.get("id") == mid), None)
+        if orig is not None and _points_at_local_router(orig, port):
+            # 旧版本 Toolkit 已改写过、原值已不可知：卸载时走启发式还原
+            entries[mid] = {"__unknown__": True}
+        else:
+            entries[mid] = copy.deepcopy(orig)
+    atomic_write_json(backup_path, {"version": 1, "created_at": int(time.time()), "entries": entries}, mode=0o600)
+
+def restore_models_json(
+    models_json_path: str = DEFAULT_MODELS_JSON,
+    backup_path: Optional[str] = None,
+    router_config_path: str = DEFAULT_ROUTER_CONFIG,
+    port: int = 8047,
+) -> Dict[str, int]:
+    """撤销 register_virtual_model_in_models_json 对 models.json 的改动（卸载时调用）。
+
+    只处理仍指向本地路由的条目，用户之后自行修改过的条目保持不动：
+    - 有备份原值 -> 还原原值；备份为"原本不存在" -> 删除；
+    - 无备份（旧版本安装）-> 用 failover_router.json 中记录的真实上游还原 url/apiKey，
+      Toolkit 自己新增的 workbuddy-autopilot / deepseek-v4.1-flash 直接删除。
+    """
+    backup_path = backup_path or _default_models_backup_path(models_json_path)
+    summary = {"restored": 0, "removed": 0, "left": 0}
+    entries: Dict[str, Any] = {}
+    try:
+        with open(backup_path, "r", encoding="utf-8") as f:
+            entries = (json.load(f) or {}).get("entries") or {}
+    except (OSError, ValueError):
+        entries = {}
+
+    try:
+        with open(models_json_path, "r", encoding="utf-8") as f:
+            current_list = json.load(f)
+    except (OSError, ValueError):
+        current_list = None
+
+    if isinstance(current_list, list):
+        upstreams = load_failover_config(router_config_path).get("upstreams", {}) or {}
+        new_list = []
+        for m in current_list:
+            if not isinstance(m, dict) or not _points_at_local_router(m, port):
+                new_list.append(m)
+                continue
+            mid = m.get("id")
+            orig = entries.get(mid, {"__unknown__": True}) if mid in entries else {"__unknown__": True}
+            if orig is None:
+                summary["removed"] += 1
+            elif not orig.get("__unknown__"):
+                new_list.append(orig)
+                summary["restored"] += 1
+            else:
+                up = upstreams.get(mid) if isinstance(upstreams, dict) else None
+                if isinstance(up, dict) and up.get("url") and not _points_at_local_router(up, port):
+                    fixed = dict(m)
+                    fixed["url"] = up["url"]
+                    fixed["apiKey"] = up.get("apiKey", "")
+                    new_list.append(fixed)
+                    summary["restored"] += 1
+                elif mid in ("workbuddy-autopilot", "deepseek-v4.1-flash"):
+                    summary["removed"] += 1
+                else:
+                    new_list.append(m)
+                    summary["left"] += 1
+        if summary["restored"] or summary["removed"]:
+            atomic_write_json(models_json_path, new_list, mode=None)
+
+    try:
+        os.remove(backup_path)
+    except OSError:
+        pass
+    return summary
+
+def _resolve_router_token(models_json_path: str) -> str:
+    """路由鉴权 Token 与 models.json 同目录（生产环境即 ~/.workbuddy/router_token）。"""
+    import router_engine  # 同在 sidecar 目录
+    return router_engine.load_or_create_router_token(
+        os.path.join(os.path.dirname(os.path.abspath(models_json_path)), "router_token")
+    )
 
 def register_virtual_model_in_models_json(
     models_json_path: str = DEFAULT_MODELS_JSON,
-    port: int = 8047
+    port: int = 8047,
+    token: Optional[str] = None,
+    backup_path: Optional[str] = None,
 ):
     """
     在 ~/.workbuddy/models.json 中配置模型接入点：
@@ -498,7 +629,9 @@ def register_virtual_model_in_models_json(
     2. 将 space-bunny-free 的 url 重定向至 8047 本地路由（真实上游已留存至 failover_router.json）
     3. 注册通用备用池 workbuddy-autopilot
     4. 保留用户原有的其他自定义模型 (Gemini, Claude, LongCat 等)
+    指向本地路由的条目使用每台机器独立生成的路由 Token 作为 apiKey，路由据此鉴权。
     """
+    router_key = token or _resolve_router_token(models_json_path)
     if not os.path.exists(models_json_path):
         current_list = []
     else:
@@ -510,13 +643,15 @@ def register_virtual_model_in_models_json(
         except Exception:
             current_list = []
 
+    _backup_managed_entries(current_list, backup_path or _default_models_backup_path(models_json_path), port)
+
     # 1. workbuddy-autopilot
     autopilot_entry = {
         "id": "workbuddy-autopilot",
         "name": "Auto Pilot (自动容灾轮换池)",
         "vendor": "FailoverRouter",
         "url": f"http://127.0.0.1:{port}/v1",
-        "apiKey": "sk-workbuddy-router-local",
+        "apiKey": router_key,
         "supportsToolCall": True,
         "supportsImages": True,
         "supportsReasoning": True,
@@ -533,7 +668,7 @@ def register_virtual_model_in_models_json(
         "name": "DeepSeek V4.1 Flash (无感容灾)",
         "vendor": "DeepSeek",
         "url": f"http://127.0.0.1:{port}/v1",
-        "apiKey": "sk-workbuddy-router-local",
+        "apiKey": router_key,
         "supportsToolCall": True,
         "supportsImages": True,
         "supportsReasoning": True,
@@ -562,10 +697,10 @@ def register_virtual_model_in_models_json(
     for m in current_list:
         if m.get("id") == "space-bunny-free":
             m["url"] = f"http://127.0.0.1:{port}/v1"
-            m["apiKey"] = "sk-workbuddy-router-local"
+            m["apiKey"] = router_key
 
-    with open(models_json_path, "w", encoding="utf-8") as f:
-        json.dump(current_list, f, indent=2, ensure_ascii=False)
+    # models.json 属于 WorkBuddy：原子写入并保留其原有权限（新建时 0600，因其中含 apiKey）
+    atomic_write_json(models_json_path, current_list, mode=None if os.path.exists(models_json_path) else 0o600)
 
 def print_model_table(inventory: List[Dict[str, Any]], active_chain: Optional[List[str]] = None):
     """格式化打印模型清单与梯队列表"""

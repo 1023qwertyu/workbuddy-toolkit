@@ -27,6 +27,16 @@ import urllib.request
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
+# 流速为估算值：session_usage 只记录每轮扣费，不记录推理耗时，按每轮固定时长折算
+ASSUMED_SECONDS_PER_TURN = 10.0
+
+# UUIDv7 时间戳合理区间（毫秒）：下界防 MD5/随机 ID 误判，上界取 2100-01-01，避免 2030 年后静默失效
+UUIDV7_MIN_TS_MS = 1700000000000
+UUIDV7_MAX_TS_MS = 4102444800000
+
+# 与 bin/workbuddy 中 SESSION_OWNER_BACKUP_TABLE 保持一致
+SESSION_OWNER_BACKUP_TABLE = "wbtk_session_owner_backup"
+
 # ANSI terminal colors (strictly disabled in non-TTY or plain mode)
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -364,8 +374,10 @@ class CreditMeter:
     def extract_turn_timestamp(req_id: str, fallback_ts: int) -> int:
         """Extracts UUIDv7 millisecond epoch timestamp with RFC 9562 verification.
         
-        Sanity boundary: 1700000000000 <= ts <= 1900000000000 (Nov 2023 ~ Mar 2030).
-        For UUID strings >= 13 hex chars, verifies version nibble is '7' (RFC 9562).
+        Sanity boundary: UUIDV7_MIN_TS_MS <= ts <= UUIDV7_MAX_TS_MS (Nov 2023 ~ 2100).
+        For UUID strings >= 13 hex chars, verifies version nibble is '7' (RFC 9562);
+        for full 32-hex UUIDs also verifies the RFC 9562 variant bits (index 16 in 8/9/a/b),
+        which keeps MD5 / random hex IDs from being misread as timestamps.
         Falls back to session updated_at for UUIDv4, MD5 hashes, or invalid IDs.
         """
         if isinstance(req_id, str):
@@ -373,9 +385,11 @@ class CreditMeter:
             if len(clean_id) >= 12:
                 try:
                     candidate = int(clean_id[:12], 16)
-                    if 1700000000000 <= candidate <= 1900000000000:
+                    if UUIDV7_MIN_TS_MS <= candidate <= UUIDV7_MAX_TS_MS:
                         # RFC 9562: UUID version nibble (index 12) must be '7'
                         if len(clean_id) >= 13 and clean_id[12] != "7":
+                            return fallback_ts
+                        if len(clean_id) == 32 and clean_id[16] not in "89ab":
                             return fallback_ts
                         return candidate
                 except Exception:
@@ -527,11 +541,20 @@ class CreditMeter:
                         session_owner[str(sid)] = str(uid)
             except Exception:
                 pass
+            try:
+                # `workbuddy init` 置空 user_id 前会把原始归属写入旁路备份表，共享模式下据此归因
+                cur = conn.cursor()
+                cur.execute(f"SELECT session_id, user_id FROM {SESSION_OWNER_BACKUP_TABLE}")
+                for sid, uid in cur.fetchall():
+                    if sid and uid and str(sid) not in session_owner:
+                        session_owner[str(sid)] = str(uid)
+            except Exception:
+                pass
             finally:
                 conn.close()
 
         snapshot_counts: Dict[str, List[str]] = {}
-        for alias, prof in profiles.items():
+        for prof in profiles.values():
             uid = prof["uid"]
             snap_path = os.path.join(self.workbuddy_dir, uid, "sidebar-list-snapshot.json")
             if os.path.exists(snap_path):
@@ -715,7 +738,7 @@ class CreditMeter:
 
         # Deduplicate profiles by UID to guarantee each physical account appears exactly once
         unique_profiles: Dict[str, Dict[str, Any]] = {}
-        for alias, prof in profiles.items():
+        for prof in profiles.values():
             uid = prof["uid"]
             if uid not in unique_profiles or prof.get("is_active"):
                 unique_profiles[uid] = prof
@@ -731,7 +754,7 @@ class CreditMeter:
             turns = acc_turns.get(uid, 0)
             active_sids = acc_sessions.get(uid, set())
 
-            active_seconds = max(turns * 10.0, 1.0)
+            active_seconds = max(turns * ASSUMED_SECONDS_PER_TURN, 1.0)
             burn_rate = round(acc_creds / active_seconds, 1) if acc_creds > 0 else 0.0
 
             account_rows.append({
@@ -749,7 +772,7 @@ class CreditMeter:
             unattr_creds = float(round(acc_credits["__unattributed__"], 1))
             unattr_turns = acc_turns.get("__unattributed__", 0)
             unattr_sids = acc_sessions.get("__unattributed__", set())
-            unattr_sec = max(unattr_turns * 10.0, 1.0)
+            unattr_sec = max(unattr_turns * ASSUMED_SECONDS_PER_TURN, 1.0)
             unattr_rate = round(unattr_creds / unattr_sec, 1) if unattr_creds > 0 else 0.0
             account_rows.append({
                 "alias": "(未归属)",
@@ -773,7 +796,7 @@ class CreditMeter:
         account_rows.sort(key=lambda x: (not x["is_active"], -x["credits"], x["alias"]))
 
         # Window-level burn rates
-        total_active_sec = max(total_active_turns * 10.0, 1.0)
+        total_active_sec = max(total_active_turns * ASSUMED_SECONDS_PER_TURN, 1.0)
         overall_burn_rate = round(total_credits / total_active_sec, 1) if total_credits > 0 else 0.0
         window_sec = max(window["duration_seconds"], 1)
         window_rate = round(total_credits / window_sec, 4) if total_credits > 0 else 0.0
@@ -782,6 +805,8 @@ class CreditMeter:
             "window": window,
             "total_credits": total_credits,
             "burn_rate_pts_per_sec": overall_burn_rate,
+            "burn_rate_is_estimate": True,
+            "assumed_seconds_per_turn": ASSUMED_SECONDS_PER_TURN,
             "window_rate_pts_per_sec": window_rate,
             "total_sessions": len(all_active_sids),
             "active_account": sanitize_alias(active_account_name) if active_account_name else None,
@@ -885,7 +910,7 @@ class CreditMeter:
             if creds <= 0:
                 continue
             turns = session_turns.get(sid, 0)
-            active_sec = max(turns * 10.0, 1.0)
+            active_sec = max(turns * ASSUMED_SECONDS_PER_TURN, 1.0)
             rate = round(creds / active_sec, 1)
             last_ts = session_last_ts.get(sid) or db_updated_map.get(sid, 0)
 
@@ -911,7 +936,7 @@ class CreditMeter:
 
         total_creds = round(sum(s["credits"] for s in session_rows), 1)
         total_turns = sum(session_turns.get(s["session_id"], 0) for s in session_rows)
-        active_sec = max(total_turns * 10.0, 1.0)
+        active_sec = max(total_turns * ASSUMED_SECONDS_PER_TURN, 1.0)
         overall_rate = round(total_creds / active_sec, 1) if total_creds > 0 else 0.0
 
         return {
@@ -921,6 +946,8 @@ class CreditMeter:
             "uid_short": matched_prof["uid_short"],
             "total_credits": total_creds,
             "burn_rate_pts_per_sec": overall_rate,
+            "burn_rate_is_estimate": True,
+            "assumed_seconds_per_turn": ASSUMED_SECONDS_PER_TURN,
             "session_count": len(session_rows),
             "sessions": session_rows,
         }
@@ -943,7 +970,7 @@ class CreditMeter:
         lines.append(f"{c_dim}╭─ WorkBuddy 积分总览 [{w_name}] ──────────────────────────────────────╮{c_reset}")
         lines.append(
             f"{c_dim}│{c_reset}  总消耗: {c_cyan}{c_bold}{data['total_credits']:,.1f} pts{c_reset}      "
-            f"生成流速: {c_yellow}{data['burn_rate_pts_per_sec']:.1f} pts/s{c_reset}     "
+            f"估算流速: {c_yellow}{data['burn_rate_pts_per_sec']:.1f} pts/s{c_reset}     "
             f"活跃会话: {c_bold}{data['total_sessions']}{c_reset}   {c_dim}│{c_reset}"
         )
         if verbose:

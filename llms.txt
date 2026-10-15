@@ -19,7 +19,7 @@ WorkBuddy Toolkit provides zero-touch local automation for WorkBuddy & CodeBuddy
 ## Quick Setup for AI Agents
 ```bash
 git clone https://github.com/FlapPearLabs/workbuddy-toolkit.git ~/.workbuddy/toolkit
-cd ~/.workbuddy/toolkit && python3 install.py
+cd ~/.workbuddy/toolkit && python3 install.py --no-input   # CLI only; add --with-checkin etc. only after the user confirms
 workbuddy doctor
 ```
 

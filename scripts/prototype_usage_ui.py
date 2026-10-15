@@ -8,9 +8,10 @@ breakdown with minimum cognitive burden, zero clutter, and zero PII leaks?
 
 Run command:
     python3 scripts/prototype_usage_ui.py
-    python3 scripts/prototype_usage_ui.py --variant A
-    python3 scripts/prototype_usage_ui.py --variant B
-    python3 scripts/prototype_usage_ui.py --variant C
+    python3 scripts/prototype_usage_ui.py --mock
+    python3 scripts/prototype_usage_ui.py --json
+
+(Variants A/B/C were folded into the combined layout shipped as `wb-usage`.)
 """
 
 import sys
@@ -202,7 +203,7 @@ def load_real_data(scope_all=False):
             "total_sessions": total_sessions,
             "accounts": accounts_result,
         }
-    except Exception as e:
+    except Exception:
         return MOCK_DATA
 
 
@@ -293,7 +294,7 @@ def main():
     parser.add_argument("--plain", action="store_true", help="Plain ASCII output without colors/unicode (pipe friendly)")
     parser.add_argument("--all", action="store_true", help="Show all-time historical usage instead of today")
     parser.add_argument("--mock", action="store_true", help="Force using dummy mock data")
-    parser.add_argument("--variant", choices=["A", "B", "C", "combined"], default="combined", help="UI Variant")
+    parser.add_argument("--variant", choices=["combined"], default="combined", help="UI Variant (A/B/C 已合并为 combined)")
     args = parser.parse_args()
 
     # Load real or mock data
@@ -309,14 +310,7 @@ def main():
         print(get_agent_json(data))
         return
 
-    if args.variant == "A":
-        print(render_variant_a(data))
-    elif args.variant == "B":
-        print(render_variant_b(data))
-    elif args.variant == "C":
-        print(render_variant_c(data))
-    else:
-        print(render_combined_abc(data, use_color=is_tty, use_unicode_bar=is_tty))
+    print(render_combined_abc(data, use_color=is_tty, use_unicode_bar=is_tty))
 
 
 if __name__ == "__main__":

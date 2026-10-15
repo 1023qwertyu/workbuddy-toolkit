@@ -113,11 +113,17 @@ class TestWorkBuddyCore(unittest.TestCase):
         cur.execute("SELECT user_id FROM sessions WHERE id = 's2';")
         self.assertEqual(cur.fetchone()[0], '', "触发器必须拦截 UPDATE 并强制恢复 user_id 为空")
 
-        # 6. 测试回滚触发器
+        # 6. 测试回滚：有备份的会话恢复到各自的原始账号，restore_uid 只兜底没有备份记录的会话
+        cur.execute("INSERT INTO sessions VALUES ('s3', '/path/c', '', 'Shared from the start');")
+        self.con.commit()
         rollback_ok = workbuddy.rollback_shared_workspace(restore_uid='user_restored')
         self.assertTrue(rollback_ok)
-        cur.execute("SELECT user_id FROM sessions WHERE id = 's1';")
-        self.assertEqual(cur.fetchone()[0], 'user_restored')
+        cur.execute("SELECT id, user_id FROM sessions ORDER BY id;")
+        self.assertEqual(dict(cur.fetchall()), {
+            's1': 'user_old_1',    # init 前的原始归属
+            's2': 'user_hijack',   # 最后一次被认领的归属
+            's3': 'user_restored', # 无备份，使用 restore_uid 兜底
+        })
 
     def test_03_profile_management_and_switch(self):
         """测试 Profile 保存、读取、免扫码切换及 Token 同步机制"""

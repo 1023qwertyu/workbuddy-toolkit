@@ -43,3 +43,4 @@ Icon
 .agents/
 .codegraph/
 .scratch/
+.ruff_cache/

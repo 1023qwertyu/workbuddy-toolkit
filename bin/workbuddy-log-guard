@@ -3,6 +3,7 @@
 import os
 import sys
 import json
+import re
 import time
 import shutil
 import subprocess
@@ -29,6 +30,7 @@ def load_config():
         "max_sessions_keep": 10,    # Max active sessions to retain
         "heal_seatbelt_rules": True, # Auto-inject temp rules into sandbox-center
         "reap_orphaned_daemons": True, # Clean up orphaned daemons when GUI is closed
+        "clean_runaway_temp_logs": True, # Truncate actively-written runaway logs in /tmp
         "max_temp_file_mb": 500,     # Runaway temp log max 500MB
         "bundle_migration_ttl_hours": 72 # Stale bundle migration TTL 72 hours
     }
@@ -49,6 +51,8 @@ def load_config():
         config["heal_seatbelt_rules"] = os.environ["WB_HEAL_SEATBELT_RULES"].lower() in ("1", "true", "yes")
     if "WB_REAP_ORPHANED_DAEMONS" in os.environ:
         config["reap_orphaned_daemons"] = os.environ["WB_REAP_ORPHANED_DAEMONS"].lower() in ("1", "true", "yes")
+    if "WB_CLEAN_RUNAWAY_TEMP_LOGS" in os.environ:
+        config["clean_runaway_temp_logs"] = os.environ["WB_CLEAN_RUNAWAY_TEMP_LOGS"].lower() in ("1", "true", "yes")
     if "WB_MAX_TEMP_FILE_MB" in os.environ:
         config["max_temp_file_mb"] = float(os.environ["WB_MAX_TEMP_FILE_MB"])
     if "WB_BUNDLE_MIGRATION_TTL_HOURS" in os.environ:
@@ -84,8 +88,8 @@ def get_open_files(directory):
 
 def truncate_file(filepath):
     try:
-        with open(filepath, 'w') as f:
-            pass # Truncate to 0
+        with open(filepath, 'w'):
+            pass  # Truncate to 0
         return True
     except Exception:
         return False
@@ -161,7 +165,7 @@ def clean_session_snapshots(sessions_dir, open_files_set=None, ttl_hours=72, max
     # Sort descending: newest sessions first
     sessions.sort(key=lambda x: x[0], reverse=True)
 
-    for idx, (mtime, sp, item) in enumerate(sessions):
+    for idx, (mtime, sp, _item) in enumerate(sessions):
         # Keep the most recent active sessions unless older than TTL
         is_older_than_ttl = (now - mtime) > ttl_seconds
         exceeds_keep = (idx >= max_keep)
@@ -219,12 +223,56 @@ def clean_shell_snapshots(snapshots_dir, ttl_hours=72):
                 pass
     return cleaned
 
-def clean_runaway_temp_logs(temp_dirs=None, max_temp_file_mb=500, log_extensions=(".log", ".txt", ".out", ".err")):
+def _is_open_by_any_process(filepath):
+    """判断文件当前是否被任意进程打开（失控日志的必要条件：仍有进程在持续写入）。
+
+    Linux 直接扫描 /proc/<pid>/fd；其他 POSIX 平台使用 lsof。无法判断时返回 False（宁可不动）。
     """
-    Surgically truncates runaway log files in temporary directories (e.g. /tmp, /private/tmp).
-    Only targets regular files owned by current user matching log extensions/patterns that exceed max_temp_file_mb.
-    Applies truncate_file() in-place to release disk blocks without deleting or breaking active file descriptors.
-    Cross-platform safe: skips Windows files if exclusive lock is held.
+    real = os.path.realpath(filepath)
+    if os.path.isdir("/proc/self/fd"):
+        try:
+            pids = [e for e in os.listdir("/proc") if e.isdigit()]
+        except OSError:
+            pids = []
+        for pid in pids:
+            fd_dir = os.path.join("/proc", pid, "fd")
+            try:
+                fds = os.listdir(fd_dir)
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    if os.readlink(os.path.join(fd_dir, fd)) == real:
+                        return True
+                except OSError:
+                    continue
+        return False
+    if shutil.which("lsof"):
+        try:
+            res = subprocess.run(["lsof", "-t", "--", real], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, text=True, timeout=10, close_fds=True)
+            return bool(res.stdout.strip())
+        except Exception:
+            return False
+    return False
+
+def clean_runaway_temp_logs(temp_dirs=None, max_temp_file_mb=500, log_extensions=(".log", ".txt", ".out", ".err"),
+                            active_window_minutes=15):
+    """
+    Surgically truncates *runaway* log files in temporary directories (e.g. /tmp, /private/tmp).
+
+    A file is only treated as runaway when ALL of the following hold:
+    - regular file (not a symlink) owned by the current user, directly inside a temp dir;
+    - its file extension is a log-like extension (suffix match only, e.g. ``t-fail.log``);
+    - it exceeds ``max_temp_file_mb``;
+    - it was modified within the last ``active_window_minutes`` and is still held open by a
+      process (POSIX), i.e. something is actively writing it.
+
+    Large files at rest (datasets, archives, databases, finished logs) are never touched:
+    they cannot grow on their own, and truncating them would silently destroy user data.
+    Applies truncate_file() in-place so active writers keep a valid descriptor.
+    Windows: "held open" is detected via a sharing violation on rename; if the writer holds an
+    exclusive lock the truncate attempt simply fails and the file is skipped.
     """
     if temp_dirs is None:
         dirs_to_check = []
@@ -243,7 +291,9 @@ def clean_runaway_temp_logs(temp_dirs=None, max_temp_file_mb=500, log_extensions
     cleaned_count = 0
     freed_bytes = 0
     max_bytes = int(max_temp_file_mb * 1024 * 1024)
+    active_window_seconds = max(0, active_window_minutes) * 60
     current_uid = os.getuid() if hasattr(os, "getuid") else None
+    now = time.time()
 
     # Track already scanned paths to prevent duplicate processing if /tmp -> /private/tmp symlink
     scanned_realpaths = set()
@@ -267,11 +317,9 @@ def clean_runaway_temp_logs(temp_dirs=None, max_temp_file_mb=500, log_extensions
                 continue
             scanned_realpaths.add(real_fp)
 
-            # Check filename extension or runaway log keyword
-            item_lower = item.lower()
-            is_log_candidate = any(item_lower.endswith(ext) for ext in log_extensions) or \
-                               any(kw in item_lower for kw in ("-fail", "-crash", "-err", "_fail", "_crash"))
-            if not is_log_candidate:
+            # 只认真正的日志后缀；不再做"文件名任意位置含 -err/-crash"的子串匹配
+            # （那会命中 dataset-errata.tar.gz、my-crash-dump.sqlite 之类的用户数据）
+            if os.path.splitext(item.lower())[1] not in log_extensions:
                 continue
 
             try:
@@ -279,17 +327,23 @@ def clean_runaway_temp_logs(temp_dirs=None, max_temp_file_mb=500, log_extensions
                 # Ensure ownership: only clean files owned by current user
                 if current_uid is not None and st.st_uid != current_uid:
                     continue
+                if st.st_size <= max_bytes:
+                    continue
+                if now - st.st_mtime > active_window_seconds:
+                    continue  # 已停止增长的大文件不是"失控"日志
 
-                if st.st_size > max_bytes:
-                    # On Windows, check if file is locked
-                    if os.name == 'nt' and is_file_open(fp, set()):
+                if os.name == 'nt':
+                    # Windows 上"仍被进程打开"表现为无法重命名（共享冲突）；没人持有的文件是静止的
+                    if not is_file_open(fp, set()):
                         continue
+                elif not _is_open_by_any_process(fp):
+                    continue  # 没有进程在写，它不会再增长
 
-                    original_size = st.st_size
-                    if truncate_file(fp):
-                        freed_bytes += original_size
-                        cleaned_count += 1
-                        print(f"[LOG_GUARD] Truncated runaway temp log: {fp} ({original_size / (1024*1024):.1f} MB)", file=sys.stderr)
+                original_size = st.st_size
+                if truncate_file(fp):
+                    freed_bytes += original_size
+                    cleaned_count += 1
+                    print(f"[LOG_GUARD] Truncated runaway temp log: {fp} ({original_size / (1024*1024):.1f} MB)", file=sys.stderr)
             except Exception:
                 pass
 
@@ -696,7 +750,7 @@ def heal_sandbox_center_rules(socket_path=None, uid=None, session_id=None):
                     pruned_sessions.append({
                         "sessionId": sid,
                         "pruned_rules": auto_grant_count + temp_count,
-                        "success": bool(del_ag and del_ag.get("success"))
+                        "success": bool(del_ag and del_ag.get("success") and del_tmp and del_tmp.get("success"))
                     })
 
         # 3. Readback verification (锁内回读校验与断言)
@@ -785,18 +839,65 @@ def is_workbuddy_gui_running():
         except Exception:
             return False
 
-def reap_orphaned_daemons(protected_keywords=None):
+DEFAULT_PROTECTED_KEYWORDS = ["zhihu", "zhihugrabber", "cargo", "rustc", "gcc", "clang", "ninja", "make",
+                              "python", "node", "npm", "vite", "webpack", "go", "pytest"]
+
+# Toolkit 自己的常驻/定时进程（router、log-guard、CLI）不算用户工作负载
+TOOLKIT_PROCESS_NAMES = {"router_engine", "workbuddy", "workbuddy-log-guard", "credit_meter", "models_inventory",
+                         "interactive_tool"}
+
+_VERSION_SUFFIX = re.compile(r"[\d.]+$")
+
+def _program_names(cmd):
+    """取命令行前两个 token 的程序名（去目录、去扩展名、去版本号后缀）。
+
+    第二个 token 用于识别解释器启动的脚本（`python3 train.py` -> python / train）。
+    只比较完整程序名，避免旧版子串匹配的误判：
+    "go" 命中 "Google Chrome"、"node" 命中任意 Electron Helper、"python" 命中 Toolkit 自己的 router。
+    """
+    names = []
+    for tok in cmd.split()[:2]:
+        base = os.path.basename(tok).lower()
+        stem = os.path.splitext(base)[0] if base.endswith((".py", ".js", ".mjs", ".cjs", ".sh")) else base
+        names.append(_VERSION_SUFFIX.sub("", stem) or stem)
+    return names
+
+def _is_toolkit_process(cmd):
+    for tok in cmd.split()[:3]:
+        base = os.path.basename(tok).lower()
+        stem = os.path.splitext(base)[0]
+        if stem in TOOLKIT_PROCESS_NAMES or base.startswith("wb-"):
+            return True
+    return False
+
+def _is_protected_workload(cmd, protected_keywords):
+    cmd_lower = cmd.lower()
+    if "sandbox" in cmd_lower or _is_toolkit_process(cmd):
+        return False
+    names = _program_names(cmd)
+    keywords = {kw.lower() for kw in protected_keywords}
+    return any(n in keywords for n in names)
+
+def reap_orphaned_daemons(protected_keywords=None, proc_list=None, lock_dir="/tmp"):
     """
     Reaps orphaned sandbox-center, sandbox-cli-gc, and codebuddy daemons
     ONLY IF WorkBuddy GUI is closed AND no protected user workloads or active sandbox sessions are running.
     """
     if protected_keywords is None:
-        protected_keywords = ["zhihu", "zhihugrabber", "cargo", "rustc", "gcc", "clang", "ninja", "make", "python", "node", "npm", "vite", "webpack", "go", "pytest"]
+        protected_keywords = DEFAULT_PROTECTED_KEYWORDS
 
     if is_workbuddy_gui_running():
         return {"reaped": False, "reason": "gui_running"}
 
-    # Inspect running processes for protected workloads and daemons
+    if proc_list is None:
+        proc_list = _list_processes()
+        if proc_list is None:
+            return {"reaped": False, "reason": "ps_failed"}
+
+    return _reap_from_process_list(proc_list, protected_keywords, lock_dir=lock_dir)
+
+def _list_processes():
+    """返回 [(pid, cmdline)]；失败返回 None。"""
     proc_list = []
     # Try zero-fork on Darwin via sysctl KERN_PROCARGS2 + libproc
     if sys.platform == "darwin":
@@ -859,20 +960,24 @@ def reap_orphaned_daemons(protected_keywords=None):
                     except ValueError:
                         pass
         except Exception:
-            return {"reaped": False, "reason": "ps_failed"}
+            return None
+    return proc_list
 
+def _reap_from_process_list(proc_list, protected_keywords, lock_dir="/tmp"):
     daemon_pids = []
     has_protected_task = False
     has_active_sandbox_cli = False
+    excluded = {os.getpid()}
+    if hasattr(os, "getppid"):
+        excluded.add(os.getppid())
 
     for pid, cmd in proc_list:
-        cmd_lower = cmd.lower()
+        if pid in excluded:
+            continue
 
-        # Check for user-protected tasks
-        for kw in protected_keywords:
-            if kw.lower() in cmd_lower and "sandbox" not in cmd_lower and "workbuddy-log-guard" not in cmd_lower:
-                has_protected_task = True
-                break
+        # Check for user-protected tasks (exact program-name match, toolkit processes excluded)
+        if not has_protected_task and _is_protected_workload(cmd, protected_keywords):
+            has_protected_task = True
 
         if "sandbox-cli " in cmd or cmd.endswith("sandbox-cli"):
             has_active_sandbox_cli = True
@@ -897,10 +1002,14 @@ def reap_orphaned_daemons(protected_keywords=None):
     if reaped_pids:
         time.sleep(0.5)
         for lock_name in ["workbuddy-sandbox-center", "workbuddy-sandbox-cli-gc"]:
-            for f in os.listdir("/tmp"):
+            try:
+                tmp_entries = os.listdir(lock_dir)
+            except OSError:
+                tmp_entries = []
+            for f in tmp_entries:
                 if f.startswith(lock_name) and f.endswith(".lock"):
                     try:
-                        os.remove(os.path.join("/tmp", f))
+                        os.remove(os.path.join(lock_dir, f))
                     except Exception:
                         pass
 
@@ -932,11 +1041,10 @@ def main():
 
     # 2. TTL Cleanup for sandbox
     if os.path.exists(SANDBOX_DIR):
-        for dirpath, dirnames, filenames in os.walk(SANDBOX_DIR):
+        for dirpath, _dirnames, filenames in os.walk(SANDBOX_DIR):
             dir_basename = os.path.basename(dirpath)
             for f in filenames:
                 fp = os.path.join(dirpath, f)
-                real_fp = os.path.realpath(fp)
                 try:
                     mtime = os.path.getmtime(fp)
                     if now - mtime > ttl_seconds:
@@ -963,12 +1071,11 @@ def main():
                         pass
             all_files.sort(key=lambda x: x[0])
             
-            for mtime, fp, dir_basename in all_files:
+            for _mtime, fp, dir_basename in all_files:
                 if current_size <= target_sandbox_bytes:
                     break
                 try:
                     size = os.path.getsize(fp)
-                    real_fp = os.path.realpath(fp)
                     if is_file_open(fp, open_files):
                         if os.name != 'nt':
                             if truncate_file(fp):
@@ -981,13 +1088,12 @@ def main():
 
     # 4. Other log dir cleanup
     if os.path.exists(LOG_DIR):
-        for dirpath, dirnames, filenames in os.walk(LOG_DIR, topdown=False):
+        for dirpath, _dirnames, filenames in os.walk(LOG_DIR, topdown=False):
             # Skip root log dir and sandbox dir correctly
             if dirpath == LOG_DIR or dirpath.startswith(os.path.join(SANDBOX_DIR, "")) or dirpath == SANDBOX_DIR:
                 continue
             for f in filenames:
                 fp = os.path.join(dirpath, f)
-                real_fp = os.path.realpath(fp)
                 try:
                     if now - os.path.getmtime(fp) > ttl_seconds:
                         if is_file_open(fp, open_files):
@@ -1007,7 +1113,7 @@ def main():
     # 5. Clean traces directory (24 hours TTL)
     traces_ttl = 24 * 3600
     if os.path.exists(TRACES_DIR):
-        for dirpath, dirnames, filenames in os.walk(TRACES_DIR, topdown=False):
+        for dirpath, _dirnames, filenames in os.walk(TRACES_DIR, topdown=False):
             for f in filenames:
                 fp = os.path.join(dirpath, f)
                 try:
@@ -1043,12 +1149,13 @@ def main():
         except Exception:
             pass
 
-    # 10. Clean runaway temp logs (default cap: 500MB)
-    try:
-        max_temp_mb = config.get("max_temp_file_mb", 500)
-        clean_runaway_temp_logs(max_temp_file_mb=max_temp_mb)
-    except Exception:
-        pass
+    # 10. Clean runaway temp logs (default cap: 500MB, only files still being written)
+    if config.get("clean_runaway_temp_logs", True):
+        try:
+            max_temp_mb = config.get("max_temp_file_mb", 500)
+            clean_runaway_temp_logs(max_temp_file_mb=max_temp_mb)
+        except Exception:
+            pass
 
     # 11. Clean stale WorkBuddy bundle migration update caches (>72h)
     try:

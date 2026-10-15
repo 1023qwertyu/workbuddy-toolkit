@@ -10,19 +10,87 @@ import os
 import sys
 import time
 import json
+import hmac
 import socket
-import select
+import secrets
+import tempfile
 import urllib.request
 import urllib.error
 import threading
 import subprocess
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 DEFAULT_WORKBUDDY_DIR = os.path.expanduser("~/.workbuddy")
 DEFAULT_ROUTER_CONFIG = os.path.join(DEFAULT_WORKBUDDY_DIR, "failover_router.json")
 DEFAULT_LOG_PATH = os.path.join(DEFAULT_WORKBUDDY_DIR, "logs", "failover_router.log")
+DEFAULT_TOKEN_PATH = os.path.join(DEFAULT_WORKBUDDY_DIR, "router_token")
+DEFAULT_MODELS_JSON = os.path.join(DEFAULT_WORKBUDDY_DIR, "models.json")
+
+# 旧版本写入 models.json 的固定占位 Key（公开字符串，不能再作为鉴权凭据）
+LEGACY_LOCAL_KEY = "sk-workbuddy-router-local"
+# 请求体上限：带图片的对话也足够，防止无界读取
+MAX_REQUEST_BODY = 64 * 1024 * 1024
+# 只接受回环地址作为 Host，抵御 DNS rebinding
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# 调用方自身请求有误导致的状态码：不代表上游故障，不触发冷却
+CLIENT_ERROR_CODES = {400, 413, 415, 422}
+
+
+def load_or_create_router_token(token_path: str = DEFAULT_TOKEN_PATH) -> str:
+    """读取（不存在则生成）本机路由鉴权 Token，文件权限 0600。"""
+    try:
+        with open(token_path, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+        if token:
+            return token
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(os.path.abspath(token_path)), exist_ok=True)
+    token = "wbr-" + secrets.token_urlsafe(32)
+    try:
+        fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # 并发创建：以先写入者为准
+        with open(token_path, "r", encoding="utf-8") as f:
+            return f.read().strip() or token
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(token + "\n")
+    return token
+
+
+def _is_local_router_url(url: str, port: int) -> bool:
+    return any(f"{h}:{port}" in (url or "") for h in ("127.0.0.1", "localhost", "[::1]"))
+
+
+def migrate_models_json_token(token: str, port: int = 8047, models_json_path: str = DEFAULT_MODELS_JSON) -> int:
+    """把 models.json 中指向本地路由、仍使用旧占位 Key 的条目升级为本机 Token。返回更新条数。"""
+    try:
+        with open(models_json_path, "r", encoding="utf-8") as f:
+            models = json.load(f)
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(models, list):
+        return 0
+    changed = 0
+    for m in models:
+        if isinstance(m, dict) and _is_local_router_url(m.get("url", ""), port) and m.get("apiKey") == LEGACY_LOCAL_KEY:
+            m["apiKey"] = token
+            changed += 1
+    if changed:
+        target_dir = os.path.dirname(os.path.abspath(models_json_path))
+        try:
+            mode = os.stat(models_json_path).st_mode & 0o777
+        except OSError:
+            mode = 0o600
+        fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=target_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(models, f, indent=2, ensure_ascii=False)
+        if os.name != "nt":
+            os.chmod(tmp, mode)
+        os.replace(tmp, models_json_path)
+    return changed
 
 def send_macos_notification(title: str, message: str):
     """通过系统 osascript 弹出轻量 macOS 通知，静默后台触发"""
@@ -86,7 +154,38 @@ class FailoverRequestHandler(BaseHTTPRequestHandler):
         # 内部静默，走结构化审计日志
         pass
 
+    def _send_json_error(self, code: int, message: str):
+        body = json.dumps({"error": {"message": message, "code": code}}).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _host_allowed(self) -> bool:
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host.startswith("["):
+            hostname = host[1:].split("]", 1)[0]
+        else:
+            hostname = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        return hostname in ALLOWED_HOSTS
+
+    def _authorized(self) -> bool:
+        expected = getattr(self.server.router_instance, "auth_token", None)
+        if not expected:
+            return False
+        supplied = ""
+        auth = self.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            supplied = auth[7:].strip()
+        elif self.headers.get("X-Api-Key"):
+            supplied = self.headers.get("X-Api-Key").strip()
+        return bool(supplied) and hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+
     def do_GET(self):
+        if not self._host_allowed():
+            self._send_json_error(403, "Host not allowed")
+            return
         if self.path in ("/health", "/v1/health", "/"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -104,12 +203,29 @@ class FailoverRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if not self._host_allowed():
+            self._send_json_error(403, "Host not allowed")
+            return
         if self.path not in ("/v1/chat/completions", "/chat/completions"):
             self.send_response(404)
             self.end_headers()
             return
-
-        content_length = int(self.headers.get("Content-Length", 0))
+        if not self._authorized():
+            # 路由会自动为官方模型注入当前账号的 accessToken，必须鉴权，否则任意本机进程/网页都能消耗积分
+            self._send_json_error(401, "Missing or invalid router token (see ~/.workbuddy/router_token)")
+            return
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            self._send_json_error(415, "Content-Type must be application/json")
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._send_json_error(400, "Invalid Content-Length")
+            return
+        if content_length < 0 or content_length > MAX_REQUEST_BODY:
+            self._send_json_error(413, f"Request body exceeds {MAX_REQUEST_BODY} bytes")
+            return
         body_bytes = self.rfile.read(content_length)
         try:
             req_data = json.loads(body_bytes.decode("utf-8"))
@@ -139,6 +255,8 @@ class FailoverRouterServer:
         self.upstreams: Dict[str, Any] = config.get("upstreams", {})
         self.cooldowns: Dict[str, float] = {}
         self.lock = threading.Lock()
+        # 鉴权 Token：显式配置优先，否则读取/生成 ~/.workbuddy/router_token
+        self.auth_token: str = config.get("auth_token") or load_or_create_router_token()
         self.server: Optional[ThreadedHTTPServer] = None
         self.server_thread: Optional[threading.Thread] = None
 
@@ -187,7 +305,8 @@ class FailoverRouterServer:
             "enabled": self.config.get("enabled", True),
             "port": self.config.get("port", 8047),
             "chain": [c.get("id") for c in self.chain],
-            "active_cooldowns": cooldown_status
+            "active_cooldowns": cooldown_status,
+            "auth_required": True
         }
 
     def find_model_config(self, model_id: str) -> Optional[Dict[str, Any]]:
@@ -271,6 +390,9 @@ class FailoverRouterServer:
 
         is_streaming = req_data.get("stream", True)
         last_error = "All candidates failed"
+        # 若所有候选都只返回了"调用方请求有误"类错误，最终原样返回该 4xx，而不是伪装成 503
+        last_client_error: Optional[tuple] = None
+        upstream_failure_seen = False
 
         # 支持子 Agent 指定专属模型：若调用方显式指定了具体模型（非 workbuddy-autopilot），
         # 则将该模型置为首位尝试；若发生 429 或故障，自动降级并由预设梯队无缝接管
@@ -483,6 +605,22 @@ class FailoverRouterServer:
 
             except urllib.error.HTTPError as he:
                 last_error = f"HTTP {he.code}: {he.reason}"
+                if he.code in CLIENT_ERROR_CODES:
+                    # 请求本身被拒绝（参数错误/体积过大等）：不是上游故障，不能冷却模型，
+                    # 否则一次坏请求就能让整条梯队停摆 cooldown_seconds。仍尝试下一个候选以兼容模型差异。
+                    try:
+                        err_body = he.read() or b""
+                    except Exception:
+                        err_body = b""
+                    last_client_error = (he.code, err_body[:65536])
+                    append_audit_log({
+                        "timestamp": int(time.time()),
+                        "event": "client_error",
+                        "reason": f"HTTP {he.code}",
+                        "model": mid
+                    })
+                    continue
+                upstream_failure_seen = True
                 self.trigger_cooldown(mid)
                 next_model = effective_chain[idx + 1].get("id") if idx + 1 < len(effective_chain) else "无备用"
                 send_macos_notification(
@@ -498,8 +636,9 @@ class FailoverRouterServer:
                 })
                 continue
 
-            except (socket.timeout, TimeoutError) as te:
+            except (socket.timeout, TimeoutError):
                 last_error = f"Timeout after {timeout_limit}s on first chunk"
+                upstream_failure_seen = True
                 self.trigger_cooldown(mid)
                 next_model = effective_chain[idx + 1].get("id") if idx + 1 < len(effective_chain) else "无备用"
                 send_macos_notification(
@@ -517,6 +656,7 @@ class FailoverRouterServer:
 
             except Exception as ex:
                 last_error = str(ex)
+                upstream_failure_seen = True
                 self.trigger_cooldown(mid)
                 continue
             finally:
@@ -525,6 +665,15 @@ class FailoverRouterServer:
                         resp.close()
                     except Exception:
                         pass
+
+        if last_client_error and not upstream_failure_seen:
+            code, body = last_client_error
+            handler.send_response(code)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            return
 
         # 若全部候选模型均告竭
         handler.send_response(503)
@@ -552,7 +701,12 @@ def run_standalone_daemon(config_path: str = DEFAULT_ROUTER_CONFIG):
         cfg = {"enabled": True, "port": 8047, "chain": []}
 
     port = cfg.get("port", 8047)
-    router = FailoverRouterServer(cfg, config_path=config_path)
+    token = cfg.get("auth_token") or load_or_create_router_token()
+    migrated = migrate_models_json_token(token, port=port)
+    if migrated:
+        append_audit_log({"timestamp": int(time.time()), "event": "models_json_token_migrated", "entries": migrated})
+        print(f"Upgraded {migrated} models.json entr{'y' if migrated == 1 else 'ies'} to the per-install router token; restart WorkBuddy to apply.")
+    router = FailoverRouterServer(dict(cfg, auth_token=token), config_path=config_path)
     print(f"WorkBuddy Failover Router starting on http://127.0.0.1:{port}...")
     router.start(port=port)
     try:
