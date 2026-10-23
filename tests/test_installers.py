@@ -6,6 +6,7 @@ Runs on macOS, Linux, and Windows to verify that install.py and platform scripts
 """
 
 import os
+import re
 import sys
 import shutil
 import tempfile
@@ -223,8 +224,11 @@ class TestInstallersE2E(unittest.TestCase):
         env["PATH"] = env.get("PATH", "") + os.pathsep + stub_dir
         launcher = os.path.join(self.temp_home, ".workbuddy", "bin", "wb-help.cmd")
 
+        # 不用 text=True：本地化提示按系统代码页落盘（中文 Windows 是 GBK），
+        # 而 WorkBuddy 客户端强制 PYTHONUTF8=1，utf-8 解码 GBK 会崩掉读取线程。
+        # bytes 模式对任何编码安全。
         res = subprocess.run(["cmd", "/c", launcher], env=env,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
     def test_launcher_ignores_store_stub_when_it_comes_first(self):
@@ -248,8 +252,9 @@ class TestInstallersE2E(unittest.TestCase):
         env["PATH"] = stub_dir + os.pathsep + env.get("PATH", "")   # 占位符在前
         launcher = os.path.join(self.temp_home, ".workbuddy", "bin", "wb-help.cmd")
 
+        # 同上：bytes 模式，避免 GBK 输出在 PYTHONUTF8=1 环境下崩掉读取线程
         res = subprocess.run(["cmd", "/c", launcher], env=env,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         # 0 = 选中了真 Python；9009 = 过滤后确实没有可用解释器。
         # 其它退出码意味着占位符被选中并执行了，正是这条用例要挡的。
@@ -323,6 +328,42 @@ class TestInstallersE2E(unittest.TestCase):
             f"9009 提示缺少商店版说明: {res.stderr!r}",
         )
         self.assertTrue(res.stderr.strip(), "9009 分支必须输出可读提示")
+
+    def test_batch_text_escaping(self):
+        """echo 参数里的 cmd 控制符必须转义，否则会提前闭合 if 块或截断命令"""
+        installer = self._load_installer("install_escape")
+        self.assertEqual(installer._escape_batch_text("a(1) & b|c"), "a^(1^) ^& b^|c")
+        self.assertEqual(installer._escape_batch_text("^x"), "^^x")
+
+    def test_launcher_hint_matches_system_codepage(self):
+        """提示按系统代码页落盘：中文 Windows 用 ANSI(GBK)，英文 Windows 回退 ASCII"""
+        if sys.platform != "win32":
+            self.skipTest("launcher 只在 Windows 上生成")
+
+        installer = os.path.join(REPO_DIR, "install.py")
+        subprocess.run([sys.executable, installer, "--no-input"], cwd=REPO_DIR,
+                       env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        launcher = os.path.join(self.temp_home, ".workbuddy", "bin", "workbuddy.cmd")
+        with open(launcher, "rb") as f:
+            raw = f.read()
+
+        try:
+            text = raw.decode("ascii")
+            self.assertIn("No usable Python 3 found", text)
+        except UnicodeDecodeError:
+            text = raw.decode("mbcs")
+            self.assertIn("未找到可用的", text)
+
+        self.assertIn("exit /b 9009", text)
+        self.assertNotIn("\r\r\n", text)
+
+        # echo 行里的半角括号会提前闭合 if 块（解析期错误，整份脚本失效），必须转义
+        for line in text.splitlines():
+            if line.strip().lower().startswith("echo"):
+                bare = re.sub(r"\^[()]", "", line)
+                self.assertNotIn("(", bare, line)
+                self.assertNotIn(")", bare, line)
 
 
 def _copy_repo(dest):
