@@ -945,6 +945,318 @@ def sync_active_token_to_profiles():
             except Exception:
                 pass
 
+# ==============================================================================
+# Account Removal（删账号：默认进回收站，可恢复；活跃账号先问人）
+# ==============================================================================
+
+TRASH_DIR_NAME = ".trash"
+
+def get_trash_dir():
+    return os.path.join(PROFILES_DIR, TRASH_DIR_NAME)
+
+def list_trashed_profiles():
+    """列出回收站里的账号文件，新的在前。
+
+    回收站放在 PROFILES_DIR 下的 .trash 子目录：get_profiles() 只扫本层、只认 .info 结尾，
+    所以躺在这里的账号不会重新出现在账号列表里，也就不会被切号、签到、体检误用。
+    """
+    trash_dir = get_trash_dir()
+    if not os.path.isdir(trash_dir):
+        return []
+    items = []
+    for fname in os.listdir(trash_dir):
+        if not fname.endswith(".info"):
+            continue
+        stem = fname[:-5]
+        alias, stamp = (stem.rsplit(".", 1) if "." in stem else (stem, ""))
+        fpath = os.path.join(trash_dir, fname)
+        try:
+            mtime = os.path.getmtime(fpath)
+        except OSError:
+            mtime = 0
+        items.append({"file": fname, "alias": alias, "saved_at": stamp, "path": fpath, "mtime": mtime})
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return items
+
+def _resolve_trash_entry(query):
+    """按回收站文件名或原别名找一条记录（别名可能有多条，取最近删除的那份）。"""
+    q = str(query or "").strip().lower()
+    if not q:
+        return None
+    entries = list_trashed_profiles()
+    for e in entries:
+        if e["file"].lower() == q or e["file"].lower() == f"{q}.info":
+            return e
+    for e in entries:
+        if e["alias"].lower() == q:
+            return e
+    return None
+
+def _count_ownership_rows(uid):
+    """只读统计该 UID 在本地库存里还剩多少归属记录。全程不写库——删账号不该动别人的历史。"""
+    counts = {}
+    if not uid or not os.path.exists(DB_FILE):
+        return counts
+    con = None
+    try:
+        # 只读 URI：路径里有空格/中文时 as_uri() 会正确转义，避免 open 失败被当成"没有记录"
+        from pathlib import Path
+        uri = f"{Path(os.path.abspath(DB_FILE)).as_uri()}?mode=ro"
+        con = sqlite3.connect(uri, uri=True, timeout=5.0)
+        for table, col in ((SESSION_OWNER_BACKUP_TABLE, "user_id"),
+                           (AUTOMATION_OWNER_BACKUP_TABLE, "owner_user_id")):
+            try:
+                row = con.execute(f"SELECT COUNT(*) FROM {table} WHERE {col} = ?", (uid,)).fetchone()
+                counts[table] = int(row[0]) if row else 0
+            except sqlite3.Error:
+                continue
+    except sqlite3.Error:
+        return counts
+    finally:
+        if con is not None:
+            con.close()
+    return counts
+
+def _confirm_removal(prompt_text):
+    """只在交互式终端里问。管道、cron、agent 调用一律当作"没确认"。"""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        ans = input(prompt_text).strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print("\n已取消。")
+        return False
+    return ans in ("y", "yes", "是", "确认")
+
+def show_trash():
+    entries = list_trashed_profiles()
+    print(f"\n{COLOR_BOLD}{COLOR_CYAN}=== 账号回收站 ==={COLOR_RESET}")
+    print(f"  位置: {get_trash_dir()}")
+    if not entries:
+        print(f"  {COLOR_YELLOW}空。{COLOR_RESET}删除账号时默认会放到这里，可随时恢复。")
+        return
+    for e in entries:
+        print(f"  • {COLOR_BOLD}{e['alias']}{COLOR_RESET}   删除于 {e['saved_at'] or '未知'}")
+    print(f"\n  恢复: {COLOR_BOLD}workbuddy rm --restore <别名>{COLOR_RESET}")
+    print(f"  彻底清空: {COLOR_BOLD}workbuddy rm --empty-trash --yes{COLOR_RESET}")
+
+def restore_profile(query):
+    """把回收站里的账号放回 auth_profiles，恢复成可切号状态。"""
+    entry = _resolve_trash_entry(query)
+    if not entry:
+        trashed = list_trashed_profiles()
+        print(f"{COLOR_RED}错误: 回收站里找不到 '{query}'。{COLOR_RESET}")
+        if trashed:
+            print("回收站现有: " + ", ".join(e["file"] for e in trashed))
+        else:
+            print("回收站是空的。")
+        return False
+    target_path = os.path.join(PROFILES_DIR, f"{entry['alias']}.info")
+    if os.path.exists(target_path):
+        print(f"{COLOR_RED}错误: 账号 '{entry['alias']}' 已经存在，恢复会覆盖它，已中止。{COLOR_RESET}")
+        print(f"  现有文件: {target_path}")
+        return False
+    os.makedirs(PROFILES_DIR, exist_ok=True)
+    os.replace(entry["path"], target_path)
+    print(f"{COLOR_GREEN}✔ 已恢复账号 '{entry['alias']}' → {target_path}{COLOR_RESET}")
+    print(f"  要切过去: {COLOR_BOLD}workbuddy switch {entry['alias']}{COLOR_RESET}")
+    return True
+
+def empty_trash(yes=False):
+    entries = list_trashed_profiles()
+    if not entries:
+        print(f"{COLOR_YELLOW}回收站已经是空的。{COLOR_RESET}")
+        return True
+    print(f"\n即将永久删除回收站里的 {len(entries)} 个账号文件（不可恢复）:")
+    for e in entries:
+        print(f"  • {e['alias']}  ({e['file']})")
+    if not yes and not _confirm_removal(f"{COLOR_YELLOW}确认清空回收站？[y/N]: {COLOR_RESET}"):
+        print("已取消，回收站未改动。")
+        return False
+    removed = 0
+    for e in entries:
+        try:
+            os.remove(e["path"])
+            removed += 1
+        except OSError as exc:
+            print(f"{COLOR_RED}删除失败 {e['file']}: {exc}{COLOR_RESET}")
+    print(f"{COLOR_GREEN}✔ 已清空 {removed}/{len(entries)} 个文件。{COLOR_RESET}")
+    return removed == len(entries)
+
+def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_active=False):
+    """删除一个已保存的账号。默认移入回收站，--purge 才真删。
+
+    为什么不一上来就 os.remove：
+      1. 命中的是**当前正在用**的账号时，本地就没它的凭证备份了，想再用只能重新扫码。
+         所以这种情况先停下问人；非交互环境（cron / agent / 管道）直接拒绝，除非 --force-active。
+      2. 物理删除不可恢复，手滑代价是重新扫码登录，默认改为移入 .trash 子目录。
+      3. 本地库里该账号的历史归属记录只统计、不修改，免得删一个号影响别的号的历史。
+    """
+    profiles = get_profiles()
+    if not profiles:
+        print(f"{COLOR_YELLOW}未在 {PROFILES_DIR} 中发现任何保存的账号，无需删除。{COLOR_RESET}")
+        return False
+    name, target = resolve_profile_target(profiles, query)
+    if not target:
+        print(f"{COLOR_RED}错误: 未找到唯一匹配 '{query}' 的账号。{COLOR_RESET}")
+        print("可用账号: " + ", ".join(profiles.keys()))
+        return False
+
+    uid = str(target.get("uid") or "").strip()
+    active_data = get_active_account()
+    active_uid = ""
+    if isinstance(active_data, dict):
+        acc = active_data.get("account")
+        if isinstance(acc, dict):
+            active_uid = str(acc.get("uid") or "").strip()
+    is_active = bool(uid and active_uid and uid == active_uid)
+    prof_path = target.get("path") or os.path.join(PROFILES_DIR, f"{name}.info")
+
+    print(f"\n{COLOR_BOLD}将要删除的账号{COLOR_RESET}")
+    print(f"  别名: {COLOR_BOLD}{name}{COLOR_RESET}")
+    print(f"  昵称: {target.get('nickname') or '(未知)'}")
+    print(f"  UID : {uid or '(未知)'}")
+    print(f"  文件: {prof_path}")
+
+    if is_active:
+        print(f"\n{COLOR_RED}▲ 注意: '{name}' 就是你当前正在使用的账号。{COLOR_RESET}")
+        print("  删掉后本地不再保存它的凭证，想再用只能重新扫码登录；客户端里当前的登录态不会自动退出。")
+        others = [n for n in profiles if n != name]
+        if others:
+            print(f"  更稳的做法是先切到别的账号: {COLOR_BOLD}workbuddy switch {others[0]}{COLOR_RESET}")
+    elif len(profiles) == 1:
+        print(f"\n{COLOR_YELLOW}▲ 这是本地唯一保存的账号，删完就没有任何可切换的账号了。{COLOR_RESET}")
+
+    if dry_run:
+        action = "永久删除" if purge else "移入回收站"
+        print(f"\n{COLOR_YELLOW}[dry-run] 仅预览：将会{action} '{name}'，未改动任何文件。{COLOR_RESET}")
+        counts = _count_ownership_rows(uid)
+        busy = " / ".join(f"{k} {v} 条" for k, v in counts.items() if v)
+        if busy:
+            print(f"  ℹ 本地库里它名下还有归属记录: {busy}（只统计，不会改动）")
+        return True
+
+    if is_active and not (yes and force_active):
+        if not sys.stdin.isatty():
+            print(f"{COLOR_RED}  非交互式环境，已阻止删除当前正在使用的账号。{COLOR_RESET}")
+            print(f"  确认要删请显式加参数: {COLOR_BOLD}workbuddy rm {name} --force-active --yes{COLOR_RESET}")
+            return False
+        if not _confirm_removal(f"{COLOR_YELLOW}  仍要删除当前正在使用的账号？输入 yes 确认: {COLOR_RESET}"):
+            print("已取消，账号未删除。")
+            return False
+    elif not is_active and not yes:
+        if not _confirm_removal(f"{COLOR_YELLOW}确认删除账号 '{name}'？[y/N]: {COLOR_RESET}"):
+            print("已取消，账号未删除。")
+            return False
+
+    dest_path = None
+    if purge:
+        try:
+            os.remove(prof_path)
+        except FileNotFoundError:
+            print(f"{COLOR_YELLOW}  文件已经不存在，继续清理缓存记录。{COLOR_RESET}")
+        except OSError as exc:
+            print(f"{COLOR_RED}删除失败: {exc}{COLOR_RESET}")
+            return False
+        print(f"{COLOR_GREEN}✔ 已永久删除账号 '{name}'（不可恢复）。{COLOR_RESET}")
+    else:
+        trash_dir = get_trash_dir()
+        try:
+            os.makedirs(trash_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            dest_path = os.path.join(trash_dir, f"{name}.{stamp}.info")
+            n = 1
+            while os.path.exists(dest_path):
+                dest_path = os.path.join(trash_dir, f"{name}.{stamp}-{n}.info")
+                n += 1
+            os.replace(prof_path, dest_path)
+        except OSError as exc:
+            print(f"{COLOR_RED}删除失败，账号文件未改动: {exc}{COLOR_RESET}")
+            return False
+        print(f"{COLOR_GREEN}✔ 已删除账号 '{name}'，文件已移入回收站。{COLOR_RESET}")
+        print(f"  回收站: {dest_path}")
+
+    if uid:
+        cache = get_audit_cache()
+        if uid in cache:
+            cache.pop(uid, None)
+            save_audit_cache(cache)
+            print(f"  ✔ 已清掉体检缓存里该账号的记录（否则状态页会显示一个已删除的账号）")
+
+    counts = _count_ownership_rows(uid)
+    busy = " / ".join(f"{k} {v} 条" for k, v in counts.items() if v)
+    if busy:
+        print(f"  ℹ 本地库里它名下还有归属记录: {busy}")
+        print(f"    这些只是历史归属备份，不影响其他账号切号，本次未改动。")
+
+    if dest_path:
+        print(f"\n  反悔可以恢复: {COLOR_BOLD}workbuddy rm --restore {name}{COLOR_RESET}")
+    return True
+
+def run_remove_cmd(args):
+    """解析 rm / wb-rm 的参数，返回退出码。"""
+    if any(a in ("-h", "--help", "help") for a in args):
+        print("""用法:
+  workbuddy rm <账号别名|昵称|UID> [选项]   删除账号（默认进回收站，可恢复）
+  workbuddy rm --list-trash                 查看回收站
+  workbuddy rm --restore <别名>             从回收站恢复某个账号
+  workbuddy rm --empty-trash [--yes]        清空回收站（不可恢复）
+
+选项:
+  -y, --yes          跳过确认（脚本 / cron 用）
+      --purge        直接永久删除，不进回收站
+  -n, --dry-run      只预览，不动任何文件
+      --force-active 允许删除当前正在使用的账号（需配合 --yes）""")
+        return 0
+
+    flags = {"-y", "--yes", "--purge", "--dry-run", "-n", "--force-active", "--list-trash", "--empty-trash"}
+    yes = any(a in ("-y", "--yes") for a in args)
+    purge = "--purge" in args
+    dry_run = any(a in ("--dry-run", "-n") for a in args)
+    force_active = "--force-active" in args
+
+    positional = []
+    restore_arg = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--restore":
+            if i + 1 >= len(args):
+                print(f"{COLOR_RED}--restore 后面要跟账号别名。{COLOR_RESET}")
+                return 1
+            restore_arg = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--restore="):
+            restore_arg = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a in flags:
+            i += 1
+            continue
+        if a.startswith("-"):
+            print(f"{COLOR_RED}未知选项: {a}{COLOR_RESET}（workbuddy rm --help 看用法）")
+            return 1
+        positional.append(a)
+        i += 1
+
+    if "--list-trash" in args:
+        show_trash()
+        return 0
+    if "--empty-trash" in args:
+        return 0 if empty_trash(yes=yes) else 1
+    if restore_arg is not None:
+        return 0 if restore_profile(restore_arg) else 1
+    if not positional:
+        print(f"{COLOR_RED}请指定要删的账号。{COLOR_RESET}")
+        print("  例: workbuddy rm old_account    |    workbuddy rm --list-trash")
+        return 1
+    if len(positional) > 1:
+        print(f"{COLOR_RED}一次只能删一个账号，收到: {', '.join(positional)}{COLOR_RESET}")
+        return 1
+    ok = remove_profile(positional[0], yes=yes, purge=purge, dry_run=dry_run, force_active=force_active)
+    return 0 if ok else 1
+
 SESSION_OWNER_BACKUP_TABLE = "wbtk_session_owner_backup"
 AUTOMATION_OWNER_BACKUP_TABLE = "wbtk_automation_owner_backup"
 
@@ -2803,6 +3115,7 @@ def interactive_menu():
         print(f" {prefix} {COLOR_BOLD}{idx}){COLOR_RESET} {name:<12} [昵称: {p['nickname']}]{status_text}{cur_text}")
 
     print(f"\n   {COLOR_BOLD}q){COLOR_RESET} 退出 (Cancel)")
+    print(f"   {COLOR_CYAN}要删账号请用命令行: workbuddy rm <别名>{COLOR_RESET}")
     print(f"{COLOR_CYAN}----------------------------------------------{COLOR_RESET}")
 
     try:
@@ -4193,6 +4506,8 @@ def print_help():
   workbuddy help                  查看本帮助信息 (别名: wb-help, workbuddy-help)
   workbuddy login [别名] [--force] 独立免登扫码录入 (别名: wb-login)
   workbuddy switch [账号名]        免重新扫码切换账号 (别名: wb-switch)
+  workbuddy rm <账号名> [选项]      删除账号，默认进回收站可恢复 (别名: wb-rm)
+                                  --dry-run 预览 / --purge 真删 / --list-trash / --restore
   workbuddy list / status [--json] 查看账号列表与凭证状态 (别名: wb-list, wb-status)
   workbuddy audit [--daemon]      凭据健康审计与常驻巡检 (别名: wb-audit)
   workbuddy usage [选项]           积分消耗与流速统计 (别名: wb-usage)
@@ -4270,6 +4585,8 @@ def main():
         else:
             interactive_menu()
         return
+    if clean_prog in ("wb-rm", "workbuddy-rm") or clean_prog.endswith("-rm"):
+        sys.exit(run_remove_cmd(args))
     if "model" in prog_name:
         run_models_cmd(args)
         return
@@ -4334,6 +4651,8 @@ def main():
             switch_to_profile(args[1], auto_restart=True)
         else:
             interactive_menu()
+    elif cmd in ["rm", "remove", "delete", "del"]:
+        sys.exit(run_remove_cmd(args[1:]))
     elif cmd in ["checkin", "check-in", "sign", "signin"]:
         with_chat = ("--no-chat" not in args)
         clean_args = [a for a in args[1:] if a != "--no-chat"]
