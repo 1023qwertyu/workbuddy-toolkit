@@ -551,14 +551,75 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
 
 
     def test_purge_missing_file_is_not_reported_as_deleted(self):
+        """真走到 purge 的 FileNotFoundError 分支（解析完到删除之间文件被外部删掉）。"""
         self._save_profile("alice", "uid_alice")
         self._save_profile("bob", "uid_bob")
         self._set_active("uid_bob")
-        os.remove(os.path.join(workbuddy.PROFILES_DIR, "alice.info"))
 
-        ok, _ = self._run(workbuddy.remove_profile, "alice", yes=True, purge=True)
+        with patch.object(workbuddy.os, "remove", side_effect=FileNotFoundError("gone")):
+            ok, out = self._run(workbuddy.remove_profile, "alice", yes=True, purge=True)
 
         self.assertFalse(ok, "文件本来就不在，不该报成功")
+        self.assertIn("没有可删的凭证", out)
+
+    def test_profile_with_null_account_still_listed(self):
+        """account 字段是 null 的历史文件不能被整份跳过（否则列表里凭空少一个账号）。"""
+        with open(os.path.join(workbuddy.PROFILES_DIR, "nullacc.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": None, "auth": {"accessToken": "T-null"}}, f)
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+
+        self.assertIn("nullacc", workbuddy.get_profiles())
+        ok, _ = self._run(workbuddy.remove_profile, "nullacc", yes=True)
+        self.assertTrue(ok)
+        self.assertFalse(self._profile_exists("nullacc"))
+
+    def test_nickname_uid_collision_refused(self):
+        """昵称恰好等于另一个账号的 UID 时，不能按"昵称优先"删错对象。"""
+        self._save_profile("nick_acc", "uid_nick", nickname="123456789")
+        self._save_profile("uid_acc", "123456789", nickname="真主人")
+        self._save_profile("keep", "uid_keep")
+        self._set_active("uid_keep")
+
+        ok, out = self._run(workbuddy.remove_profile, "123456789", yes=True)
+
+        self.assertFalse(ok)
+        self.assertTrue(self._profile_exists("nick_acc"))
+        self.assertTrue(self._profile_exists("uid_acc"))
+        self.assertIn("同时是", out)
+
+    def test_remove_by_full_uin(self):
+        """只有 uin 的老账号文件，按完整 uin 也要能定位并删掉。"""
+        with open(os.path.join(workbuddy.PROFILES_DIR, "uinonly.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": {"uin": "998877", "nickname": "老张"},
+                       "auth": {"accessToken": "T-uin"}}, f)
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+
+        ok, _ = self._run(workbuddy.remove_profile, "998877", yes=True)
+
+        self.assertTrue(ok)
+        self.assertFalse(self._profile_exists("uinonly"))
+
+    def test_restore_picks_latest_deletion(self):
+        """同别名删两次，恢复要拿到后删的那份（不能按文件 mtime 排）。"""
+        self._save_profile("tw", "uid_v1")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+        workbuddy.remove_profile("tw", yes=True)
+
+        # 把第一份备份的 mtime 推后，模拟"账号最后被写的时间很晚"——按 mtime 排就会挑错
+        trash = os.path.join(workbuddy.PROFILES_DIR, ".trash")
+        first = [f for f in os.listdir(trash) if f.endswith(".info")][0]
+        future = time.time() + 3600
+        os.utime(os.path.join(trash, first), (future, future))
+
+        self._save_profile("tw", "uid_v2")
+        workbuddy.remove_profile("tw", yes=True)
+        workbuddy.restore_profile("tw")
+
+        with open(os.path.join(workbuddy.PROFILES_DIR, "tw.info"), "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["account"]["uid"], "uid_v2", "应恢复最近删除的那份")
 
     def test_alias_named_help_can_still_be_removed(self):
         self._save_profile("help", "uid_help")
@@ -655,7 +716,7 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertFalse(self._profile_exists("broken"), "坏备份不能被塞进账号目录")
-        self.assertIn("损坏", out)
+        self.assertIn("不像是账号凭证", out)
 
     def test_empty_trash_with_target_rejected(self):
         """--purge 写成 --empty-trash 还带账号名时，不能默默清空整个回收站。"""
@@ -730,7 +791,19 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertFalse(self._profile_exists("junk"))
-        self.assertIn("损坏", out)
+        self.assertIn("不像是账号凭证", out)
+
+    def test_restore_rejects_empty_shell_account(self):
+        """`{"account": {}}` 不是账号，不能恢复成一个空壳 profile。"""
+        trash = os.path.join(workbuddy.PROFILES_DIR, ".trash")
+        os.makedirs(trash, exist_ok=True)
+        with open(os.path.join(trash, "fake.20260101-000000.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": {}}, f)
+
+        ok, _ = self._run(workbuddy.restore_profile, "fake")
+
+        self.assertFalse(ok)
+        self.assertFalse(self._profile_exists("fake"))
 
     # ---------- 签到不能把删掉的号存回来 ----------
 
@@ -748,20 +821,33 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
         self.assertEqual(sorted(workbuddy.get_profiles().keys()), ["alice"], "签到不能把刚删掉的号自动存回来")
         self.assertIn("跳过自动收录", out)
 
-    def test_checkin_reimports_after_relogin(self):
-        """用户重新登录（登录态文件被刷新）后，就允许重新收录了。"""
+    def test_tombstone_survives_client_token_refresh(self):
+        """客户端每 2 小时刷 token 会改登录态文件的 mtime，这不等于用户想要这个账号回来。"""
         self._save_profile("alice", "uid_alice")
         self._save_profile("bob", "uid_bob")
         self._set_active("uid_bob")
         workbuddy.remove_profile("bob", yes=True, force_active=True)
 
-        future = time.time() + 60
+        # 模拟客户端刷新 token 回写登录态：内容/时间都变了，但用户没说要这个账号
+        future = time.time() + 7200
         os.utime(workbuddy.AUTH_FILE, (future, future))
-        profiles = workbuddy.get_profiles()
-        workbuddy._auto_import_active_profile(workbuddy.get_active_account(), profiles)
+        workbuddy._auto_import_active_profile(workbuddy.get_active_account(), workbuddy.get_profiles())
+
+        self.assertEqual(sorted(workbuddy.get_profiles().keys()), ["alice"],
+                         "token 刷新不能让删掉的账号自己回来")
+
+    def test_relogin_clears_tombstone(self):
+        """用户主动 workbuddy login 之后，才允许重新收录。"""
+        self._save_profile("alice", "uid_alice")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+        workbuddy.remove_profile("bob", yes=True, force_active=True)
+
+        workbuddy._clear_tombstone("uid_bob")   # 等价于 login / save 成功后的动作
+        workbuddy._auto_import_active_profile(workbuddy.get_active_account(), workbuddy.get_profiles())
 
         uids = [p["uid"] for p in workbuddy.get_profiles().values()]
-        self.assertIn("uid_bob", uids, "重新登录后应恢复正常收录")
+        self.assertIn("uid_bob", uids, "主动重新登录后应恢复正常收录")
 
     def test_switch_still_works_after_removal(self):
         """验收 B：删完号，剩下的账号还得能正常切。"""

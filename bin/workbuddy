@@ -826,7 +826,9 @@ def get_profiles():
             try:
                 with open(fpath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    acc = data.get("account", {}) if isinstance(data, dict) else {}
+                    acc = data.get("account") if isinstance(data, dict) else None
+                    if not isinstance(acc, dict):
+                        acc = {}
                     nick = get_display_nickname(acc, default_name=name)
                     # UID 可能写在 account.uid / account.userId / 顶层（老数据），都要认，
                     # 否则按 UID 定位账号在老账号文件上会"找不到"。
@@ -979,10 +981,13 @@ def list_trashed_profiles():
         except OSError:
             mtime = 0
         items.append({"file": fname, "alias": alias, "saved_at": stamp, "path": fpath, "mtime": mtime})
-    items.sort(key=lambda x: x["mtime"], reverse=True)
+    # 按删除时间（文件名里的时间戳）排，新的在前。不能用文件 mtime：
+    # os.replace 会保留原文件的修改时间，按 mtime 排等于按"账号最后被写过"排，会恢复错的那份。
+    items.sort(key=lambda x: (x["saved_at"] or "", x["file"]), reverse=True)
     return items
 
 DELETED_MARKER_NAME = "deleted.json"
+TOMBSTONE_LIMIT = 200
 
 def _tombstone_path():
     return os.path.join(get_trash_dir(), DELETED_MARKER_NAME)
@@ -995,35 +1000,44 @@ def _load_tombstones():
     except Exception:
         return {}
 
-def _record_tombstone(uid):
-    """记一笔"这个账号是用户手动删的"，供签到任务判断要不要自动收录。"""
-    if not uid:
-        return
-    marks = _load_tombstones()
-    marks[str(uid)] = time.time()
+def _save_tombstones(marks):
+    # 只留最近的若干条，避免这个文件无界增长
+    if len(marks) > TOMBSTONE_LIMIT:
+        kept = sorted(marks.items(), key=lambda kv: kv[1])[-TOMBSTONE_LIMIT:]
+        marks = dict(kept)
     try:
         os.makedirs(get_trash_dir(), exist_ok=True)
         atomic_write_json(_tombstone_path(), marks)
     except Exception:
         pass
 
-def _deleted_recently(uid):
-    """这个 UID 是不是刚被手动删过、且登录态还停在那次登录上。
+def _record_tombstone(uid):
+    """记一笔"这个账号是用户手动删的"，供签到任务判断要不要自动收录。"""
+    if not uid:
+        return
+    marks = _load_tombstones()
+    marks[str(uid)] = time.time()
+    _save_tombstones(marks)
 
-    用文件时间判断：登录态文件的 mtime 早于删除时间 → 还是同一份登录，
-    签到任务不该把它自动存回账号列表；用户重新登录会刷新登录态文件，之后就允许收录。
+def _clear_tombstone(uid):
+    """用户主动重新登录 / 保存这个账号时解除标记。"""
+    if not uid:
+        return
+    marks = _load_tombstones()
+    if str(uid) in marks:
+        marks.pop(str(uid), None)
+        _save_tombstones(marks)
+
+def _is_tombstoned(uid):
+    """这个 UID 是不是被用户手动删过、之后又没主动登录回来。
+
+    不能用"登录态文件有没有被改过"来判断：客户端每隔约 2 小时刷新一次 token 会
+    回写这个文件，那样标记撑不过两个小时，"删了又回来"照样发生。
+    所以只有用户显式执行 login / save（这两个入口会清标记）才算重新要这个账号。
     """
     if not uid:
         return False
-    ts = _load_tombstones().get(str(uid))
-    if not ts:
-        return False
-    try:
-        if os.path.exists(AUTH_FILE) and os.path.getmtime(AUTH_FILE) > float(ts):
-            return False
-    except (OSError, TypeError, ValueError):
-        pass
-    return True
+    return str(uid) in _load_tombstones()
 
 def _resolve_trash_entry(query):
     """按回收站文件名或原别名找一条记录（别名可能有多条，取最近删除的那份）。"""
@@ -1111,12 +1125,31 @@ def _same_access_token(a, b):
     ta, tb = _get_access_token(a), _get_access_token(b)
     return bool(ta and tb and ta == tb)
 
+def _display_name_key(data):
+    """取昵称用来做弱比对；取不到就返回空串，避免"未知用户"这种占位值互相匹配。"""
+    if not isinstance(data, dict):
+        return ""
+    acc = data.get("account") if isinstance(data.get("account"), dict) else {}
+    try:
+        nick = get_display_nickname(acc, default_name="")
+    except Exception:
+        return ""
+    nick = str(nick or "").strip()
+    return "" if nick in ("", "未知用户", "未命名") else nick
+
 def _is_same_account(a, b):
-    """两份凭证是不是同一个账号：两边都有 ID 就比 ID，任一边缺 ID 才退回比 token。"""
+    """两份凭证是不是同一个账号：两边都有 ID 就比 ID，否则退回 token / 昵称。
+
+    误判方向是安全的：多认成"同一个账号"只会让删除更谨慎（停下来问人）。
+    """
     keys_a, keys_b = _profile_identity(a), _profile_identity(b)
     if keys_a and keys_b:
         return bool(keys_a & keys_b)
-    return _same_access_token(a, b)
+    if _same_access_token(a, b):
+        return True
+    # 有一边完全没有 ID、token 又各刷各的：昵称一致就按"可能是同一个"处理
+    name_a, name_b = _display_name_key(a), _display_name_key(b)
+    return bool(name_a and name_b and name_a.lower() == name_b.lower())
 
 def _confirm_removal(prompt_text):
     """只在交互式终端里问。管道、cron、agent 调用一律当作"没确认"。"""
@@ -1161,12 +1194,12 @@ def restore_profile(query):
     try:
         with open(entry["path"], "r", encoding="utf-8") as f:
             content = json.load(f)
-        if not isinstance(content, dict) or not (
-            isinstance(content.get("account"), dict) or isinstance(content.get("auth"), dict)
-        ):
-            raise ValueError("内容不是账号 JSON（既没有 account 也没有 auth）")
+        if not isinstance(content, dict):
+            raise ValueError("内容不是账号 JSON")
+        if not (_profile_identity(content) or _get_access_token(content)):
+            raise ValueError("内容里既没有账号 ID 也没有 accessToken")
     except Exception as exc:
-        print(f"{COLOR_RED}错误: 回收站里的备份已损坏（{exc}），已中止恢复。{COLOR_RESET}")
+        print(f"{COLOR_RED}错误: 回收站里的备份不像是账号凭证（{exc}），已中止恢复。{COLOR_RESET}")
         print(f"  文件: {entry['path']}")
         return False
     os.makedirs(PROFILES_DIR, exist_ok=True)
@@ -1234,8 +1267,30 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
     profiles = get_profiles()
     target = None
     name = ""
+    q = str(query or "").strip()
     if profiles:
-        name, target = resolve_profile_target(profiles, query, allow_uid_prefix=False)
+        # 删除的解析优先级：精确别名 > 完整 UID（含 userId/uin）> 昵称。
+        # 不能直接用切号那套（别名 > 昵称 > UID）：昵称恰好等于别人的 UID 时，
+        # 会删掉昵称撞车的那个，UID 真正的主人反而留下。
+        if q and q in profiles:
+            name, target = q, profiles[q]
+        else:
+            uid_hits = [n for n, p in profiles.items() if q and q in _profile_identity(p.get("data"))]
+            nick_hits = [n for n, p in profiles.items()
+                         if q and _display_name_key(p.get("data")).lower() == q.lower()]
+            if uid_hits and nick_hits and set(uid_hits) != set(nick_hits):
+                print(f"{COLOR_RED}错误: '{query}' 同时是 {', '.join(uid_hits)} 的 UID、"
+                      f"{', '.join(nick_hits)} 的昵称。{COLOR_RESET}")
+                print("  为防删错，请改用账号别名: " + ", ".join(sorted(set(uid_hits) | set(nick_hits))))
+                return False
+            if len(uid_hits) == 1:
+                name, target = uid_hits[0], profiles[uid_hits[0]]
+            elif len(uid_hits) > 1:
+                print(f"{COLOR_RED}错误: '{query}' 对应 {len(uid_hits)} 个别名: {', '.join(uid_hits)}{COLOR_RESET}")
+                print("  只删一个别名账号仍会留在列表里，请按别名逐个删: " + ", ".join(uid_hits))
+                return False
+            else:
+                name, target = resolve_profile_target(profiles, query, allow_uid_prefix=False)
     if not target:
         # 兜底：别名对应的文件还在，但内容坏了（JSON 解析失败）→ get_profiles 会静默跳过它，
         # 于是这个文件变成"列表里看不到、命令也删不掉"的死文件。允许按别名把它删掉。
@@ -2404,6 +2459,7 @@ def run_login(alias=None, auto_switch=True, force=False):
     final_target_path = os.path.join(PROFILES_DIR, f"{final_alias}.info")
 
     atomic_write_json(final_target_path, profile_data)
+    _clear_tombstone(uid)
 
     cache = get_audit_cache()
     if uid:
@@ -3114,9 +3170,9 @@ def _auto_import_active_profile(active_data, profiles):
     active_uid = acc.get("uid") if isinstance(acc, dict) else None
     if not active_uid or any(p["uid"] == active_uid for p in profiles.values()):
         return profiles
-    if _deleted_recently(active_uid):
+    if _is_tombstoned(active_uid):
         print(f"{COLOR_YELLOW}ℹ 当前登录的账号 ({mask_uid(active_uid)}) 已被手动删除，跳过自动收录。{COLOR_RESET}")
-        print(f"  重新登录该账号后才会再次自动保存；要彻底退出请在客户端里退出登录。")
+        print(f"  要重新要回这个账号，执行 workbuddy login 重新登录即可；要彻底退出请在客户端里退出登录。")
         return profiles
     nickname = get_display_nickname(acc if isinstance(acc, dict) else {}, default_name=str(active_uid)[:8])
     clean_name = re.sub(r"[^\w\-]", "_", str(nickname)).strip("_") or str(active_uid)[:8]
@@ -3354,6 +3410,7 @@ def save_current(name, force=False):
     final_name, is_inplace = resolve_profile_alias_conflict(name, uid, force=force)
     target_path = os.path.join(PROFILES_DIR, f"{final_name}.info")
     atomic_write_json(target_path, active_data)
+    _clear_tombstone(uid)
     if is_inplace:
         print(f"{COLOR_GREEN}✔ 当前登录态已在位平滑更新至 Profile: '{final_name}' (昵称: {nickname}, UID: {uid}){COLOR_RESET}")
     else:
