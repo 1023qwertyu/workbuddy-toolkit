@@ -938,6 +938,93 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
         self.assertFalse(self._profile_exists("alice"))
         self.assertLessEqual(len(workbuddy._load_tombstones()), workbuddy.TOMBSTONE_LIMIT)
 
+    def test_active_detected_when_ids_differ_but_token_same(self):
+        """profile 只有 uin、登录态只有 uid，两个值还不同，但 token 相同 → 同一个账号。"""
+        with open(os.path.join(workbuddy.PROFILES_DIR, "old.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": {"uin": "999888777", "nickname": "OldUser"},
+                       "auth": {"accessToken": "SAME-TOKEN"}}, f)
+        os.makedirs(os.path.dirname(workbuddy.AUTH_FILE), exist_ok=True)
+        with open(workbuddy.AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": "U-real-777", "nickname": "OldUser"},
+                       "auth": {"accessToken": "SAME-TOKEN"}}, f)
+
+        with patch.object(sys.stdin, "isatty", return_value=False):
+            ok, out = self._run(workbuddy.remove_profile, "old", yes=True)
+
+        self.assertFalse(ok, "token 相同就说明是同一个登录态，不能当普通账号删")
+        self.assertTrue(self._profile_exists("old"))
+
+    def test_active_detected_when_ids_differ_but_nickname_same(self):
+        """ID 对不上、token 各刷各的，但昵称一样 → 仍按"可能是同一个"处理（安全方向）。"""
+        with open(os.path.join(workbuddy.PROFILES_DIR, "old.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": {"uin": "999888777", "nickname": "OldUser"},
+                       "auth": {"accessToken": "T-profile"}}, f)
+        os.makedirs(os.path.dirname(workbuddy.AUTH_FILE), exist_ok=True)
+        with open(workbuddy.AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": "U-real-777", "nickname": "OldUser"},
+                       "auth": {"accessToken": "T-live"}}, f)
+
+        with patch.object(sys.stdin, "isatty", return_value=False):
+            ok, _ = self._run(workbuddy.remove_profile, "old", yes=True)
+
+        self.assertFalse(ok)
+        self.assertTrue(self._profile_exists("old"))
+
+    def test_siblings_detected_across_different_id_fields(self):
+        """两个别名一个写 uin、一个写 uid（值还不同）但 token 相同 → 要提示还剩哪个别名。"""
+        with open(os.path.join(workbuddy.PROFILES_DIR, "dup_uin.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": {"uin": "999888777", "nickname": "OldUser"},
+                       "auth": {"accessToken": "SAME-TOKEN"}}, f)
+        with open(os.path.join(workbuddy.PROFILES_DIR, "dup_uid.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": "U-real-777", "nickname": "OldUser"},
+                       "auth": {"accessToken": "SAME-TOKEN"}}, f)
+        self._save_profile("keep", "uid_keep")
+        self._set_active("uid_keep")
+
+        ok, out = self._run(workbuddy.remove_profile, "dup_uin", yes=True)
+
+        self.assertTrue(ok)
+        self.assertFalse(self._profile_exists("dup_uin"))
+        self.assertTrue(self._profile_exists("dup_uid"))
+        self.assertIn("dup_uid", out, "另一个别名也要被点名")
+        self.assertIn("还挂在别的别名下", out)
+
+    def test_numeric_uid_is_kept(self):
+        """数字型 uid 也不能丢（别让 status 显示"无UID"、switch 失效）。"""
+        with open(os.path.join(workbuddy.PROFILES_DIR, "numuid.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": 123456789, "nickname": "Num"},
+                       "auth": {"accessToken": "T-num"}}, f)
+
+        self.assertEqual(workbuddy.get_profiles()["numuid"]["uid"], "123456789")
+
+    def test_non_object_profile_file_can_be_removed(self):
+        """合法 JSON 但不是账号对象（[] / null）的 .info，也得能按别名删掉。"""
+        for alias, body in (("listfile", "[]"), ("nullfile", "null")):
+            with open(os.path.join(workbuddy.PROFILES_DIR, f"{alias}.info"), "w", encoding="utf-8") as f:
+                f.write(body)
+        self._save_profile("keep", "uid_keep")
+        self._set_active("uid_keep")
+
+        ok, _ = self._run(workbuddy.remove_profile, "listfile", yes=True)
+        self.assertTrue(ok)
+        self.assertFalse(self._profile_exists("listfile"))
+
+        ok, _ = self._run(workbuddy.remove_profile, "nullfile", yes=True)
+        self.assertTrue(ok)
+        self.assertFalse(self._profile_exists("nullfile"))
+
+    def test_tombstone_write_failure_warns_for_normal_account_too(self):
+        """非当前账号删掉后墓碑写失败，也要告警（否则哪天它变成当前账号就会被签到存回来）。"""
+        self._save_profile("alice", "uid_alice")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+
+        with patch.object(workbuddy, "_save_tombstones", return_value=False):
+            ok, out = self._run(workbuddy.remove_profile, "alice", yes=True)
+
+        self.assertTrue(ok)
+        self.assertIn("没能", out)
+
     def test_switch_still_works_after_removal(self):
         """验收 B：删完号，剩下的账号还得能正常切。"""
         self._save_profile("alice", "uid_alice")

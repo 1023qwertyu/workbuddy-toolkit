@@ -834,8 +834,10 @@ def get_profiles():
                     # UID 可能写在 account.uid / account.userId / 顶层（老数据），都要认，
                     # 否则按 UID 定位账号在老账号文件上会"找不到"。
                     uid_raw = acc.get("uid") or acc.get("userId") or data.get("uid") or data.get("userId")
-                    if not isinstance(uid_raw, str):
-                        # uid 正常是字符串；万一被写成对象（例如加密信封）就不要当身份用
+                    if isinstance(uid_raw, (int, float)) and not isinstance(uid_raw, bool):
+                        uid_raw = str(uid_raw)   # 数字型 uid 也是合法身份，别丢
+                    elif not isinstance(uid_raw, str):
+                        # 其它类型（例如被写成对象/加密信封）不能当身份用
                         uid_raw = ""
                     uid_str = str(uid_raw).strip() if uid_raw is not None else ""
                     uin_raw = acc.get("uin") if isinstance(acc, dict) else ""
@@ -1234,18 +1236,17 @@ def _display_name_key(data):
     return "" if nick in ("", "未知用户", "未命名") else nick
 
 def _is_same_account(a, b):
-    """两份凭证是不是同一个账号：两边都有 ID 就比 ID，否则退回 token / 昵称。
+    """两份凭证是不是同一个账号：身份值、accessToken、昵称，任一相同就算同一个。
 
-    已知边界（能力上限，不是 bug）：两份文件用了完全不同的 ID 字段、昵称还被改过时
-    （例如 profile 只有 uid、登录态只有 uin、昵称也不一样），这里判不出来，会按
-    "不是当前账号"处理。删当前账号前先 workbuddy switch 到别的号，可以绕开这个边界。
+    这里是"证据或"而不是"证据与"：uid 和 uin 本来就是两套编号，老 profile 只写 uin、
+    登录态只写 uid 是完全可能的，两边 ID 不相等不代表不是同一个账号。
+    漏判的后果是删掉正在用的号（危险方向），多判的后果只是多问一句（安全方向），
+    所以这里一律取宽。
     """
-    keys_a, keys_b = _profile_identity(a), _profile_identity(b)
-    if keys_a and keys_b:
-        return bool(keys_a & keys_b)
+    if _profile_identity(a) & _profile_identity(b):
+        return True
     if _same_access_token(a, b):
         return True
-    # 有一边完全没有 ID、token 又各刷各的：昵称一致就按"可能是同一个"处理
     name_a, name_b = _display_name_key(a), _display_name_key(b)
     return bool(name_a and name_b and name_a.lower() == name_b.lower())
 
@@ -1350,8 +1351,12 @@ def _broken_profile_path(query):
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
-            json.load(f)
-        return None
+            content = json.load(f)
+        # 能解析成"像账号的 JSON"才算正常文件；解析出来是列表/null/空壳，一律按坏文件处理，
+        # 否则它在列表里看不见、又没有任何命令能删掉。
+        if isinstance(content, dict) and (_profile_identity(content) or _get_access_token(content)):
+            return None
+        return path
     except Exception:
         return path
 
@@ -1440,8 +1445,12 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
 
     if is_active:
         print(f"\n{COLOR_RED}▲ 注意: '{name}' 就是你当前正在使用的账号。{COLOR_RESET}")
-        print("  删掉后本地不再保存它的凭证，想再用只能重新扫码登录；客户端里当前的登录态不会自动退出。")
-        others = [n for n in profiles if n != name]
+        if siblings:
+            print(f"  删掉后 '{name}' 这个别名不再持有凭证，但 {', '.join(siblings)} 仍持有同一个账号的凭证，")
+            print(f"  所以重新扫码之前也还能切回去；想彻底清掉请把剩下的别名也删了。")
+        else:
+            print("  删掉后本地不再保存它的凭证，想再用只能重新扫码登录；客户端里当前的登录态不会自动退出。")
+        others = [n for n in profiles if n != name and n not in siblings]
         if others:
             print(f"  更稳的做法是先切到别的账号: {COLOR_BOLD}workbuddy switch {others[0]}{COLOR_RESET}")
     elif len(profiles) == 1:
@@ -1523,11 +1532,12 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
             print(f"  ✔ 已清掉体检缓存里该账号的记录")
     if is_active:
         print(f"  ℹ 客户端的登录态没动，所以状态页仍会把这号显示为当前账号——这是预期，不是残留。")
-        if tombstoned:
-            print(f"  ℹ 签到任务也不会再把它自动存回列表；等你主动 workbuddy login 重新登录，它才会被重新收录。")
-        else:
-            print(f"{COLOR_YELLOW}  ▲ 但没能把\"已删除\"这个状态记下来（{_tombstone_path()} 写不进去），{COLOR_RESET}")
-            print(f"    下次签到可能把这个账号重新存回列表。要彻底干净请在客户端里退出登录。")
+    if not tombstoned:
+        # 这种情况必须说出来，否则"删了等于没删"会静默发生
+        print(f"{COLOR_YELLOW}  ▲ 没能把\"已删除\"这个状态记下来（{_tombstone_path()} 写不进去）。{COLOR_RESET}")
+        print(f"    下次签到可能把这个账号重新存回列表。要彻底干净请在客户端里退出登录。")
+    elif is_active:
+        print(f"  ℹ 签到任务也不会再把它自动存回列表；等你主动 workbuddy login 重新登录，它才会被重新收录。")
 
     counts = _count_ownership_rows(uid)
     busy = " / ".join(f"{k} {v} 条" for k, v in counts.items() if v)
