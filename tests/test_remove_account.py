@@ -16,6 +16,7 @@ import sys
 import json
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -149,11 +150,100 @@ class TestRemoveAccount(_SandboxMixin, unittest.TestCase):
         self._set_active("uid_alice")
 
         with patch.object(sys.stdin, "isatty", return_value=False):
-            ok, out = self._run(workbuddy.remove_profile, "alice", yes=True)
+            ok, out = self._run(workbuddy.remove_profile, "alice")
 
         self.assertFalse(ok, "非交互环境不许删当前账号")
         self.assertTrue(self._profile_exists("alice"))
         self.assertIn("非交互", out)
+
+    def test_active_account_refused_when_only_yes(self):
+        """脚本加 -y 不等于"同意删当前账号"，必须再显式 --force-active。"""
+        self._save_profile("alice", "uid_alice")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_alice")
+
+        with patch.object(sys.stdin, "isatty", return_value=False):
+            ok, out = self._run(workbuddy.remove_profile, "alice", yes=True)
+
+        self.assertFalse(ok)
+        self.assertTrue(self._profile_exists("alice"))
+        self.assertIn("已拒绝", out)
+
+    def test_active_account_detected_via_legacy_userid_field(self):
+        """老数据把 UID 写在 account.userId 里，也必须认出它是当前账号。"""
+        legacy = {"account": {"userId": "uid_legacy", "nickname": "老数据"}, "auth": {"accessToken": "t"}}
+        with open(os.path.join(workbuddy.PROFILES_DIR, "legacy.info"), "w", encoding="utf-8") as f:
+            json.dump(legacy, f)
+        os.makedirs(os.path.dirname(workbuddy.AUTH_FILE), exist_ok=True)
+        with open(workbuddy.AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump(legacy, f)
+
+        with patch.object(sys.stdin, "isatty", return_value=False):
+            ok, out = self._run(workbuddy.remove_profile, "legacy", yes=True)
+
+        self.assertFalse(ok, "userId 形态的当前账号也不能被 -y 静默删掉")
+        self.assertTrue(self._profile_exists("legacy"))
+
+    def test_active_account_detected_via_shared_uin(self):
+        """一边只有 uin、一边有 uid + uin 时，靠共有的 uin 也要认出是同一个账号。"""
+        self._save_profile("alice", "uid_alice", nickname="小A")
+        # profile 里补上 uin
+        path = os.path.join(workbuddy.PROFILES_DIR, "alice.info")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["account"]["uin"] = "998877"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        # 登录态只有 uin
+        os.makedirs(os.path.dirname(workbuddy.AUTH_FILE), exist_ok=True)
+        with open(workbuddy.AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uin": "998877", "nickname": "小A"}, "auth": {"accessToken": "t"}}, f)
+
+        with patch.object(sys.stdin, "isatty", return_value=False):
+            ok, _ = self._run(workbuddy.remove_profile, "alice", yes=True)
+
+        self.assertFalse(ok)
+        self.assertTrue(self._profile_exists("alice"))
+
+    def test_survives_missing_stdin(self):
+        """stdin 为 None（无控制台句柄）时不能抛 traceback，按非交互拒绝处理。"""
+        self._save_profile("alice", "uid_alice")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_alice")
+
+        with patch.object(sys, "stdin", None):
+            ok, _ = self._run(workbuddy.remove_profile, "alice")
+
+        self.assertFalse(ok)
+        self.assertTrue(self._profile_exists("alice"))
+
+    # ---------- 同一账号多个别名 ----------
+
+    def test_uid_query_refused_when_multiple_aliases(self):
+        """按 UID 删但该 UID 有两个别名时，只删一个等于没删 —— 必须拒绝并让人按别名删。"""
+        self._save_profile("dup1", "uid_dup")
+        self._save_profile("dup2", "uid_dup")
+        self._save_profile("other", "uid_other")
+        self._set_active("uid_other")
+
+        ok, out = self._run(workbuddy.remove_profile, "uid_dup", yes=True)
+
+        self.assertFalse(ok)
+        self.assertTrue(self._profile_exists("dup1"))
+        self.assertTrue(self._profile_exists("dup2"))
+        self.assertIn("别名", out)
+
+    def test_alias_delete_warns_about_twin_alias(self):
+        self._save_profile("dup1", "uid_dup")
+        self._save_profile("dup2", "uid_dup")
+        self._set_active("uid_other")
+
+        ok, out = self._run(workbuddy.remove_profile, "dup1", yes=True)
+
+        self.assertTrue(ok)
+        self.assertFalse(self._profile_exists("dup1"))
+        self.assertTrue(self._profile_exists("dup2"))
+        self.assertIn("别的别名", out)
 
     def test_active_account_needs_force_active_with_yes(self):
         self._save_profile("alice", "uid_alice")
@@ -456,6 +546,121 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertTrue(self._profile_exists("alice"))
+
+
+    def test_purge_missing_file_is_not_reported_as_deleted(self):
+        self._save_profile("alice", "uid_alice")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+        os.remove(os.path.join(workbuddy.PROFILES_DIR, "alice.info"))
+
+        ok, _ = self._run(workbuddy.remove_profile, "alice", yes=True, purge=True)
+
+        self.assertFalse(ok, "文件本来就不在，不该报成功")
+
+    def test_alias_named_help_can_still_be_removed(self):
+        self._save_profile("help", "uid_help")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+
+        code, _ = self._run(workbuddy.run_remove_cmd, ["help", "-y"])
+
+        self.assertEqual(code, 0)
+        self.assertFalse(self._profile_exists("help"), "叫 help 的账号也要能删")
+
+    def test_help_keyword_still_works_without_such_alias(self):
+        self._save_profile("alice", "uid_alice")
+
+        code, out = self._run(workbuddy.run_remove_cmd, ["help"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("用法", out)
+        self.assertTrue(self._profile_exists("alice"))
+
+    def test_switch_still_works_after_removal(self):
+        """验收 B：删完号，剩下的账号还得能正常切。"""
+        self._save_profile("alice", "uid_alice")
+        self._save_profile("keep", "uid_keep")
+        self._set_active("uid_alice")
+
+        workbuddy.remove_profile("alice", yes=True, force_active=True)
+
+        with patch.object(workbuddy, "restart_workbuddy", lambda *a, **k: None):
+            ok = workbuddy.switch_to_profile("keep", auto_restart=False, check_health=False)
+
+        self.assertTrue(ok)
+        with open(workbuddy.AUTH_FILE, "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["account"]["uid"], "uid_keep")
+
+    # ---------- 真实进程：main() 分发 ----------
+
+    def _make_home_layout(self):
+        """按子进程自己解析路径的方式铺一份 home（~/.workbuddy 下）。"""
+        home = os.path.join(self.tmp, "home")
+        profiles = os.path.join(home, ".workbuddy", "auth_profiles")
+        auth_dir = os.path.join(home, ".workbuddy", "auth")
+        os.makedirs(profiles, exist_ok=True)
+        os.makedirs(auth_dir, exist_ok=True)
+        for alias, uid in (("alice", "uid_alice"), ("bob", "uid_bob")):
+            with open(os.path.join(profiles, f"{alias}.info"), "w", encoding="utf-8") as f:
+                json.dump({"account": {"uid": uid, "nickname": alias}, "auth": {"accessToken": "t"}}, f)
+        with open(os.path.join(auth_dir, "workbuddy-desktop.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": "uid_bob", "nickname": "bob"}, "auth": {"accessToken": "t"}}, f)
+        env = os.environ.copy()
+        env.update({
+            "HOME": home,
+            "USERPROFILE": home,
+            "APPDATA": os.path.join(home, "appdata"),
+            "LOCALAPPDATA": os.path.join(home, "localappdata"),
+            "XDG_CONFIG_HOME": os.path.join(home, "xdg"),
+            "NO_COLOR": "1",
+        })
+        return home, profiles, env
+
+    def test_main_dispatch_removes_account(self):
+        home, profiles, env = self._make_home_layout()
+        script = os.path.join(REPO_DIR, "bin", "workbuddy")
+
+        proc = subprocess.run([sys.executable, script, "rm", "alice", "-y"],
+                              capture_output=True, text=True, env=env, timeout=120)
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(profiles, "alice.info")))
+        self.assertTrue(os.path.exists(os.path.join(profiles, "bob.info")))
+        trash = os.path.join(profiles, ".trash")
+        self.assertEqual(len(os.listdir(trash)), 1)
+
+    def test_main_dispatch_blocks_active_account(self):
+        home, profiles, env = self._make_home_layout()
+        script = os.path.join(REPO_DIR, "bin", "workbuddy")
+
+        proc = subprocess.run([sys.executable, script, "rm", "bob", "-y"],
+                              capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL, timeout=120)
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertTrue(os.path.exists(os.path.join(profiles, "bob.info")))
+
+    def test_prog_name_alias_dispatch(self):
+        """wb-rm 这个入口文件名的分发要真的生效（install.py 装的就是这个别名）。"""
+        home, profiles, env = self._make_home_layout()
+        alias_script = os.path.join(home, "wb-rm")
+        shutil.copy(os.path.join(REPO_DIR, "bin", "workbuddy"), alias_script)
+
+        proc = subprocess.run([sys.executable, alias_script, "alice", "-y"],
+                              capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(profiles, "alice.info")))
+
+        # 多敲一次 "rm" 也要认（wb-rm rm bob 这种手滑）
+        proc = subprocess.run([sys.executable, alias_script, "rm", "bob", "-y", "--force-active"],
+                              capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(profiles, "bob.info")))
+
+        proc = subprocess.run([sys.executable, alias_script, "--list-trash"],
+                              capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("回收站", proc.stdout)
 
 
 if __name__ == "__main__":

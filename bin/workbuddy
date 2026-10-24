@@ -1017,9 +1017,37 @@ def _count_ownership_rows(uid):
             con.close()
     return counts
 
+def _stdin_is_tty():
+    """stdin 可能是 None（pythonw / 无控制台句柄）或已被关闭，这类情况一律按非交互处理。"""
+    stdin = getattr(sys, "stdin", None)
+    if stdin is None:
+        return False
+    try:
+        return bool(stdin.isatty())
+    except (ValueError, OSError):
+        return False
+
+def _profile_identity(data):
+    """从一份凭证 JSON 里取出可比对的账号身份。
+
+    老版本账号文件里 UID 可能写在 account.userId 或顶层，只认 account.uid 会让
+    "当前正在使用的账号"判断失效（于是 -y 能静默删掉正在用的号），所以这里三种都收。
+    """
+    keys = set()
+    if not isinstance(data, dict):
+        return keys
+    acc = data.get("account") if isinstance(data.get("account"), dict) else {}
+    for field in ("uid", "userId", "uin"):
+        for holder in (acc, data):
+            val = holder.get(field) if isinstance(holder, dict) else None
+            if val is None or str(val).strip() == "":
+                continue
+            keys.add(f"{field}:{str(val).strip()}")
+    return keys
+
 def _confirm_removal(prompt_text):
     """只在交互式终端里问。管道、cron、agent 调用一律当作"没确认"。"""
-    if not sys.stdin.isatty():
+    if not _stdin_is_tty():
         return False
     try:
         ans = input(prompt_text).strip().lower()
@@ -1103,20 +1131,30 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
         return False
 
     uid = str(target.get("uid") or "").strip()
-    active_data = get_active_account()
-    active_uid = ""
-    if isinstance(active_data, dict):
-        acc = active_data.get("account")
-        if isinstance(acc, dict):
-            active_uid = str(acc.get("uid") or "").strip()
-    is_active = bool(uid and active_uid and uid == active_uid)
+    target_keys = _profile_identity(target.get("data"))
+    active_keys = _profile_identity(get_active_account())
+    is_active = bool(target_keys & active_keys)
     prof_path = target.get("path") or os.path.join(PROFILES_DIR, f"{name}.info")
+
+    # 同一个账号可能挂在多个别名下（老数据、手工复制都常见）。按 UID / 昵称这种"非别名"输入删，
+    # 实际只删掉其中一个别名，用户会以为整个账号没了 —— 这种输入直接拒绝，要求按别名删。
+    siblings = [n for n, p in profiles.items()
+                if n != name and target_keys & _profile_identity(p.get("data"))]
+    query_is_alias = str(query or "").strip().lower() == name.lower()
+    if siblings and not query_is_alias:
+        print(f"{COLOR_RED}错误: '{query}' 对应 {1 + len(siblings)} 个别名: {name}, {', '.join(siblings)}{COLOR_RESET}")
+        print(f"  只删一个别名，账号仍会留在列表里。请按别名逐个删: {COLOR_BOLD}workbuddy rm {name}{COLOR_RESET}")
+        return False
 
     print(f"\n{COLOR_BOLD}将要删除的账号{COLOR_RESET}")
     print(f"  别名: {COLOR_BOLD}{name}{COLOR_RESET}")
     print(f"  昵称: {target.get('nickname') or '(未知)'}")
     print(f"  UID : {uid or '(未知)'}")
     print(f"  文件: {prof_path}")
+
+    if siblings:
+        print(f"\n{COLOR_YELLOW}▲ 同一账号还挂在别的别名下: {', '.join(siblings)}。{COLOR_RESET}")
+        print(f"  删掉 '{name}' 后账号仍会留在账号列表里，要清干净请逐个删。")
 
     if is_active:
         print(f"\n{COLOR_RED}▲ 注意: '{name}' 就是你当前正在使用的账号。{COLOR_RESET}")
@@ -1136,8 +1174,14 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
             print(f"  ℹ 本地库里它名下还有归属记录: {busy}（只统计，不会改动）")
         return True
 
-    if is_active and not (yes and force_active):
-        if not sys.stdin.isatty():
+    if is_active and not (force_active and yes):
+        # -y 是"批量脚本在跑"的信号，这种情况下不许悄悄删掉当前正在用的号，
+        # 必须再显式给 --force-active 才算说清楚了。
+        if yes:
+            print(f"{COLOR_RED}  已拒绝: 加 -y 但仍未确认要删当前账号。{COLOR_RESET}")
+            print(f"  确实要删请补上: {COLOR_BOLD}workbuddy rm {name} --force-active --yes{COLOR_RESET}")
+            return False
+        if not _stdin_is_tty():
             print(f"{COLOR_RED}  非交互式环境，已阻止删除当前正在使用的账号。{COLOR_RESET}")
             print(f"  确认要删请显式加参数: {COLOR_BOLD}workbuddy rm {name} --force-active --yes{COLOR_RESET}")
             return False
@@ -1154,7 +1198,14 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
         try:
             os.remove(prof_path)
         except FileNotFoundError:
-            print(f"{COLOR_YELLOW}  文件已经不存在，继续清理缓存记录。{COLOR_RESET}")
+            print(f"{COLOR_YELLOW}  文件已经不存在（可能已被手工删掉），没有可删的凭证。{COLOR_RESET}")
+            if uid:
+                cache = get_audit_cache()
+                if uid in cache:
+                    cache.pop(uid, None)
+                    save_audit_cache(cache)
+                    print(f"  ✔ 顺带清掉了体检缓存里的残留记录")
+            return False
         except OSError as exc:
             print(f"{COLOR_RED}删除失败: {exc}{COLOR_RESET}")
             return False
@@ -1181,7 +1232,9 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
         if uid in cache:
             cache.pop(uid, None)
             save_audit_cache(cache)
-            print(f"  ✔ 已清掉体检缓存里该账号的记录（否则状态页会显示一个已删除的账号）")
+            print(f"  ✔ 已清掉体检缓存里该账号的记录")
+    if is_active:
+        print(f"  ℹ 客户端的登录态没动，所以状态页仍会把这号显示为当前账号——这是预期，不是残留。")
 
     counts = _count_ownership_rows(uid)
     busy = " / ".join(f"{k} {v} 条" for k, v in counts.items() if v)
@@ -1195,7 +1248,11 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
 
 def run_remove_cmd(args):
     """解析 rm / wb-rm 的参数，返回退出码。"""
-    if any(a in ("-h", "--help", "help") for a in args):
+    wants_help = any(a in ("-h", "--help") for a in args)
+    if not wants_help and len(args) == 1 and args[0].lower() == "help":
+        # `rm help`：只有本地真的没有叫 help 的账号时才当帮助，否则它是删除目标
+        wants_help = "help" not in get_profiles()
+    if wants_help:
         print("""用法:
   workbuddy rm <账号别名|昵称|UID> [选项]   删除账号（默认进回收站，可恢复）
   workbuddy rm --list-trash                 查看回收站
@@ -4586,7 +4643,9 @@ def main():
             interactive_menu()
         return
     if clean_prog in ("wb-rm", "workbuddy-rm") or clean_prog.endswith("-rm"):
-        sys.exit(run_remove_cmd(args))
+        # 已经按别名进来了，用户再多敲一次 "rm" 也认（wb-rm rm alice）
+        sub_args = args[1:] if args and args[0].lower() in ("rm", "remove", "delete", "del") else args
+        sys.exit(run_remove_cmd(sub_args))
     if "model" in prog_name:
         run_models_cmd(args)
         return
