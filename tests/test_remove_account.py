@@ -570,7 +570,7 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
         self._set_active("uid_bob")
 
         self.assertIn("nullacc", workbuddy.get_profiles())
-        ok, _ = self._run(workbuddy.remove_profile, "nullacc", yes=True)
+        ok, _ = self._run(workbuddy.remove_profile, "nullacc", yes=True, force_active=True)  # 读不出 ID，按"拿不准"需显式强制
         self.assertTrue(ok)
         self.assertFalse(self._profile_exists("nullacc"))
 
@@ -596,7 +596,7 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
         self._save_profile("bob", "uid_bob")
         self._set_active("uid_bob")
 
-        ok, _ = self._run(workbuddy.remove_profile, "998877", yes=True)
+        ok, _ = self._run(workbuddy.remove_profile, "998877", yes=True, force_active=True)  # 只有 uin，和登录态无法比 → 拿不准
 
         self.assertTrue(ok)
         self.assertFalse(self._profile_exists("uinonly"))
@@ -954,8 +954,8 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
         self.assertFalse(ok, "token 相同就说明是同一个登录态，不能当普通账号删")
         self.assertTrue(self._profile_exists("old"))
 
-    def test_active_detected_when_ids_differ_but_nickname_same(self):
-        """ID 对不上、token 各刷各的，但昵称一样 → 仍按"可能是同一个"处理（安全方向）。"""
+    def test_undecidable_identity_requires_explicit_force(self):
+        """ID 对不上、token 也不同、昵称一样 → 昵称不算证据，按"无法确认"处理，必须显式强制。"""
         with open(os.path.join(workbuddy.PROFILES_DIR, "old.info"), "w", encoding="utf-8") as f:
             json.dump({"account": {"uin": "999888777", "nickname": "OldUser"},
                        "auth": {"accessToken": "T-profile"}}, f)
@@ -965,9 +965,10 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
                        "auth": {"accessToken": "T-live"}}, f)
 
         with patch.object(sys.stdin, "isatty", return_value=False):
-            ok, _ = self._run(workbuddy.remove_profile, "old", yes=True)
+            ok, out = self._run(workbuddy.remove_profile, "old", yes=True)
 
-        self.assertFalse(ok)
+        self.assertFalse(ok, "拿不准的时候不许脚本静默删")
+        self.assertIn("无法确认", out)
         self.assertTrue(self._profile_exists("old"))
 
     def test_siblings_detected_across_different_id_fields(self):
@@ -981,7 +982,7 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
         self._save_profile("keep", "uid_keep")
         self._set_active("uid_keep")
 
-        ok, out = self._run(workbuddy.remove_profile, "dup_uin", yes=True)
+        ok, out = self._run(workbuddy.remove_profile, "dup_uin", yes=True, force_active=True)  # 与登录态不可比 → 拿不准
 
         self.assertTrue(ok)
         self.assertFalse(self._profile_exists("dup_uin"))
@@ -1005,11 +1006,11 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
         self._save_profile("keep", "uid_keep")
         self._set_active("uid_keep")
 
-        ok, _ = self._run(workbuddy.remove_profile, "listfile", yes=True)
+        ok, _ = self._run(workbuddy.remove_profile, "listfile", yes=True, force_active=True)
         self.assertTrue(ok)
         self.assertFalse(self._profile_exists("listfile"))
 
-        ok, _ = self._run(workbuddy.remove_profile, "nullfile", yes=True)
+        ok, _ = self._run(workbuddy.remove_profile, "nullfile", yes=True, force_active=True)
         self.assertTrue(ok)
         self.assertFalse(self._profile_exists("nullfile"))
 
@@ -1024,6 +1025,88 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertIn("没能", out)
+
+    # ---------- 同名昵称不是同一个账号（第六/七轮审查的 P1 原样复现） ----------
+
+    def test_same_nickname_different_accounts_are_not_confused(self):
+        """两个不相干账号都叫"微信用户"时：按完整 UID 必须能删，且不能把另一个说成同一账号。"""
+        self._save_profile("acc1", "U-A", nickname="微信用户")
+        self._save_profile("acc2", "U-B", nickname="微信用户")
+        self._save_profile("keep", "U-C")
+        self._set_active("U-C")
+
+        ok, out = self._run(workbuddy.remove_profile, "U-A", yes=True)
+
+        self.assertTrue(ok, "完整 UID 只对应 acc1，不该被判成多别名")
+        self.assertFalse(self._profile_exists("acc1"))
+        self.assertTrue(self._profile_exists("acc2"), "另一个账号不能被牵连")
+        self.assertNotIn("还挂在别的别名下", out)
+
+    def test_same_nickname_alias_delete_does_not_claim_twin(self):
+        """按别名删时，不能把同昵称的另一个账号说成"账号本体仍在它下面"。"""
+        self._save_profile("acc1", "U-A", nickname="微信用户")
+        self._save_profile("acc2", "U-B", nickname="微信用户")
+        self._set_active("U-OTHER")
+
+        ok, out = self._run(workbuddy.remove_profile, "acc1", yes=True)
+
+        self.assertTrue(ok)
+        self.assertNotIn("acc2", out, "同昵称不同 UID 的账号不该出现在提示里")
+
+    def test_unknown_relation_requires_force_even_with_yes(self):
+        """证据不足时，-y 不够；--force-active --yes 才放行。"""
+        with open(os.path.join(workbuddy.PROFILES_DIR, "old.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": {"uin": "999888777"}, "auth": {"accessToken": "T-p"}}, f)
+        os.makedirs(os.path.dirname(workbuddy.AUTH_FILE), exist_ok=True)
+        with open(workbuddy.AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": "U-real"}, "auth": {"accessToken": "T-l"}}, f)
+
+        with patch.object(sys.stdin, "isatty", return_value=False):
+            ok, _ = self._run(workbuddy.remove_profile, "old", yes=True)
+        self.assertFalse(ok)
+        self.assertTrue(self._profile_exists("old"))
+
+        with patch.object(sys.stdin, "isatty", return_value=False):
+            ok, _ = self._run(workbuddy.remove_profile, "old", yes=True, force_active=True)
+        self.assertTrue(ok, "显式 --force-active --yes 应当放行")
+        self.assertFalse(self._profile_exists("old"))
+
+    def test_alias_wins_over_other_account_uid_case_insensitively(self):
+        """`Alice` 存在、另一个账号的 uid 恰好是 `alice`：敲小写别名不能删到别人头上。"""
+        self._save_profile("Alice", "uid_alice_owner")
+        self._save_profile("bob", "alice")
+        self._set_active("uid_other")
+
+        ok, out = self._run(workbuddy.remove_profile, "alice", yes=True)
+
+        self.assertTrue(ok)
+        self.assertFalse(self._profile_exists("Alice"), "应当删的是别名 Alice")
+        self.assertTrue(self._profile_exists("bob"), "bob 不能被误删")
+
+    def test_clearing_tombstone_removes_all_keys(self):
+        """登录/保存要把 uid、uin、token 指纹一起解掉，只解 uid 会留下"仍算已删除"。"""
+        data = {"account": {"uid": "U-1", "uin": "888888"}, "auth": {"accessToken": "TOK-X"}}
+        keys = workbuddy._tombstone_keys(data)
+        self.assertGreaterEqual(len(keys), 3)
+
+        workbuddy._record_tombstones(keys)
+        self.assertTrue(workbuddy._is_tombstoned(data))
+
+        workbuddy._clear_tombstones(keys)
+        self.assertFalse(workbuddy._is_tombstoned(data))
+
+    def test_broken_file_does_not_claim_tombstone_write_failure(self):
+        """坏文件没有身份值可记，不能假报"墓碑写不进去"。"""
+        broken = os.path.join(workbuddy.PROFILES_DIR, "dead.info")
+        with open(broken, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+
+        ok, out = self._run(workbuddy.remove_profile, "dead", yes=True, force_active=True)
+
+        self.assertTrue(ok)
+        self.assertNotIn("没能", out)
 
     def test_switch_still_works_after_removal(self):
         """验收 B：删完号，剩下的账号还得能正常切。"""

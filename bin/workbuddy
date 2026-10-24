@@ -1051,11 +1051,13 @@ def _tombstone_lock():
         return None, lock_path
 
 def _tombstone_unlock(fd, lock_path):
-    if fd is not None:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    """只在自己真的拿到锁时才删锁文件；不然会把别人正持有的锁删掉。"""
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
     try:
         os.remove(lock_path)
     except OSError:
@@ -1083,10 +1085,14 @@ def _tombstone_keys(data, uid=""):
     return keys
 
 def _record_tombstones(keys):
-    """把若干个键记为"用户手动删过"，返回是否落盘成功。"""
+    """把若干个键记为"用户手动删过"。
+
+    返回值是三态：True 写成功 / False 写失败 / None 根本没有可记的键
+    （调用方要区分开，别把"没东西可记"说成"写不进去"）。
+    """
     keys = {str(k).strip() for k in (keys or []) if str(k).strip()}
     if not keys:
-        return False
+        return None
     fd, lock_path = _tombstone_lock()
     try:
         marks = _load_tombstones()
@@ -1186,29 +1192,35 @@ def _stdin_is_tty():
     except (ValueError, OSError):
         return False
 
-def _profile_identity(data):
-    """从一份凭证 JSON 里取出账号身份值（uid / userId / uin 一律平权）。
+ID_NAMESPACES = ("uid", "uin")
 
-    两个坑都要绕开：
-      1. 老数据把 UID 写在 account.userId（本仓库自己也把它归一成 uid），
-         有的文件只有 uin，所以不能按字段名分组比对，否则"当前正在用的账号"判不出来；
-      2. 有的老文件干脆没有任何 ID 字段，那就靠 accessToken 兜底（见 _same_access_token）。
+def _profile_named_ids(data):
+    """按命名空间收集身份值：{'uid': {...}, 'uin': {...}}。
 
-    误判方向是安全的：多认成"同一个账号"只会让删除更谨慎（停下来问人），
-    不会反过来把不相干的账号当成活跃账号去删。
+    `userId` 归到 uid 命名空间（本仓库自己也把它归一成 uid）。
+    分成两个集合是有意的：uid 与 uin 是两套编号，混在一起比会漏判；
+    但"同一个命名空间下两边都有值且不相等"就是明确的"不是同一个账号"。
     """
-    keys = set()
+    out = {"uid": set(), "uin": set()}
     if not isinstance(data, dict):
-        return keys
+        return out
     acc = data.get("account") if isinstance(data.get("account"), dict) else {}
     for holder in (acc, data):
         if not isinstance(holder, dict):
             continue
-        for field in ("uid", "userId", "uin"):
+        for field in ("uid", "userId"):
             val = holder.get(field)
             if val is not None and str(val).strip():
-                keys.add(str(val).strip())
-    return keys
+                out["uid"].add(str(val).strip())
+        uin = holder.get("uin")
+        if uin is not None and str(uin).strip():
+            out["uin"].add(str(uin).strip())
+    return out
+
+def _profile_identity(data):
+    """一份凭证里所有能当身份用的值（两个命名空间取并集），用于记墓碑键。"""
+    named = _profile_named_ids(data)
+    return named["uid"] | named["uin"]
 
 def _get_access_token(data):
     if not isinstance(data, dict):
@@ -1219,12 +1231,15 @@ def _get_access_token(data):
     return ""
 
 def _same_access_token(a, b):
-    """没有任何 ID 字段可比时，同一个 accessToken 就说明是同一个登录态。"""
+    """同一个 accessToken 就等于同一个登录态。"""
     ta, tb = _get_access_token(a), _get_access_token(b)
     return bool(ta and tb and ta == tb)
 
 def _display_name_key(data):
-    """取昵称用来做弱比对；取不到就返回空串，避免"未知用户"这种占位值互相匹配。"""
+    """取昵称用于显示与"按昵称查找"；取不到就返回空串，避免"未知用户"这种占位值互相匹配。
+
+    注意：昵称只做查找和提示，绝不参与"是不是同一个账号"的判定。
+    """
     if not isinstance(data, dict):
         return ""
     acc = data.get("account") if isinstance(data.get("account"), dict) else {}
@@ -1236,19 +1251,33 @@ def _display_name_key(data):
     return "" if nick in ("", "未知用户", "未命名") else nick
 
 def _is_same_account(a, b):
-    """两份凭证是不是同一个账号：身份值、accessToken、昵称，任一相同就算同一个。
+    """能不能**确证**是同一个账号：ID 值有交集，或 accessToken 完全相同。
 
-    这里是"证据或"而不是"证据与"：uid 和 uin 本来就是两套编号，老 profile 只写 uin、
-    登录态只写 uid 是完全可能的，两边 ID 不相等不代表不是同一个账号。
-    漏判的后果是删掉正在用的号（危险方向），多判的后果只是多问一句（安全方向），
-    所以这里一律取宽。
+    昵称故意不参与判定：默认昵称（"微信用户"之类）撞车太常见，
+    把它当身份用会把两个不相干的账号认成一个，结果是删错人。
     """
     if _profile_identity(a) & _profile_identity(b):
         return True
-    if _same_access_token(a, b):
-        return True
-    name_a, name_b = _display_name_key(a), _display_name_key(b)
-    return bool(name_a and name_b and name_a.lower() == name_b.lower())
+    return _same_access_token(a, b)
+
+def _account_relation(target, active):
+    """目标账号与"当前正在使用的账号"的关系：same / different / unknown。
+
+    - same      ：能确证是同一个（ID 有交集或 token 相同）；
+    - different ：能确证不是同一个（同一 ID 命名空间下两边都有值且不相等，或压根没有登录态）；
+    - unknown   ：证据不足（例如一边只有 uid、一边只有 uin，值还不同）。
+
+    unknown 一律交给用户确认，不靠脚本猜——这就是"不猜"原则。
+    """
+    if not isinstance(active, dict) or not active:
+        return "different"
+    if _is_same_account(target, active):
+        return "same"
+    t_named, a_named = _profile_named_ids(target), _profile_named_ids(active)
+    for ns in ID_NAMESPACES:
+        if t_named[ns] and a_named[ns] and not (t_named[ns] & a_named[ns]):
+            return "different"
+    return "unknown"
 
 def _confirm_removal(prompt_text):
     """只在交互式终端里问。管道、cron、agent 调用一律当作"没确认"。"""
@@ -1374,11 +1403,12 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
     name = ""
     q = str(query or "").strip()
     if profiles:
-        # 删除的解析优先级：精确别名 > 完整 UID（含 userId/uin）> 昵称。
-        # 不能直接用切号那套（别名 > 昵称 > UID）：昵称恰好等于别人的 UID 时，
-        # 会删掉昵称撞车的那个，UID 真正的主人反而留下。
-        if q and q in profiles:
-            name, target = q, profiles[q]
+        # 删除的解析优先级：别名（不区分大小写）> 完整 UID（含 userId/uin）> 昵称。
+        # 别名必须先查，且不能区分大小写：`Alice` 存在、另一个账号的 uid 恰好是 `alice` 时，
+        # 用户敲 `alice` 的本意显然是那个别名，不能删到另一个账号头上。
+        alias_hit = q and next((n for n in profiles if n.lower() == q.lower()), None)
+        if alias_hit:
+            name, target = alias_hit, profiles[alias_hit]
         else:
             uid_hits = [n for n, p in profiles.items() if q and q in _profile_identity(p.get("data"))]
             nick_hits = [n for n, p in profiles.items()
@@ -1420,7 +1450,9 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
     uid = str(target.get("uid") or "").strip()
     target_data = target.get("data")
     active_data = get_active_account()
-    is_active = _is_same_account(target_data, active_data)
+    relation = _account_relation(target_data, active_data)
+    is_active = relation == "same"
+    maybe_active = relation == "unknown"
     prof_path = target.get("path") or os.path.join(PROFILES_DIR, f"{name}.info")
 
     # 同一个账号可能挂在多个别名下（老数据、手工复制都常见）。按 UID / 昵称这种"非别名"输入删，
@@ -1453,6 +1485,10 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
         others = [n for n in profiles if n != name and n not in siblings]
         if others:
             print(f"  更稳的做法是先切到别的账号: {COLOR_BOLD}workbuddy switch {others[0]}{COLOR_RESET}")
+    elif maybe_active:
+        print(f"\n{COLOR_YELLOW}▲ 无法确认'{name}'是不是你当前正在使用的账号。{COLOR_RESET}")
+        print("  它和登录态里的身份字段对不上号（例如一边只有 uid、一边只有 uin），工具不猜。")
+        print(f"  想确认现在用的是谁: {COLOR_BOLD}workbuddy status{COLOR_RESET}")
     elif len(profiles) == 1:
         print(f"\n{COLOR_YELLOW}▲ 这是本地唯一保存的账号，删完就没有任何可切换的账号了。{COLOR_RESET}")
 
@@ -1465,21 +1501,30 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
             print(f"  ℹ 本地库里它名下还有归属记录: {busy}（只统计，不会改动）")
         return True
 
-    if is_active and not (force_active and yes):
-        # -y 是"批量脚本在跑"的信号，这种情况下不许悄悄删掉当前正在用的号，
-        # 必须再显式给 --force-active 才算说清楚了。
+    # 删号原则：能确证不是当前账号，才允许脚本静默删；
+    # "是当前账号"和"没法确认是不是当前账号"都算风险，必须由人显式确认。
+    risky = is_active or maybe_active
+    if risky and not (force_active and yes):
         if yes:
-            print(f"{COLOR_RED}  已拒绝: 加 -y 但仍未确认要删当前账号。{COLOR_RESET}")
+            if is_active:
+                print(f"{COLOR_RED}  已拒绝: 加 -y 但仍未确认要删当前账号。{COLOR_RESET}")
+            else:
+                print(f"{COLOR_RED}  已拒绝: 无法确认它是不是当前账号，光加 -y 不够。{COLOR_RESET}")
             print(f"  确实要删请补上: {COLOR_BOLD}workbuddy rm {name} --force-active --yes{COLOR_RESET}")
             return False
         if not _stdin_is_tty():
-            print(f"{COLOR_RED}  非交互式环境，已阻止删除当前正在使用的账号。{COLOR_RESET}")
+            if is_active:
+                print(f"{COLOR_RED}  非交互式环境，已阻止删除当前正在使用的账号。{COLOR_RESET}")
+            else:
+                print(f"{COLOR_RED}  非交互式环境，无法确认它是不是当前账号，已阻止删除。{COLOR_RESET}")
             print(f"  确认要删请显式加参数: {COLOR_BOLD}workbuddy rm {name} --force-active --yes{COLOR_RESET}")
             return False
-        if not _confirm_removal(f"{COLOR_YELLOW}  仍要删除当前正在使用的账号？输入 yes 确认: {COLOR_RESET}"):
+        prompt = ("  仍要删除当前正在使用的账号？输入 yes 确认: " if is_active
+                  else "  无法确认它是不是当前账号，仍要删除？输入 yes 确认: ")
+        if not _confirm_removal(f"{COLOR_YELLOW}{prompt}{COLOR_RESET}"):
             print("已取消，账号未删除。")
             return False
-    elif not is_active and not yes:
+    elif not risky and not yes:
         if not _confirm_removal(f"{COLOR_YELLOW}确认删除账号 '{name}'？[y/N]: {COLOR_RESET}"):
             print("已取消，账号未删除。")
             return False
@@ -1532,12 +1577,15 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
             print(f"  ✔ 已清掉体检缓存里该账号的记录")
     if is_active:
         print(f"  ℹ 客户端的登录态没动，所以状态页仍会把这号显示为当前账号——这是预期，不是残留。")
-    if not tombstoned:
-        # 这种情况必须说出来，否则"删了等于没删"会静默发生
+    if tombstoned is False:
+        # 写失败必须说出来，否则"删了等于没删"会静默发生
         print(f"{COLOR_YELLOW}  ▲ 没能把\"已删除\"这个状态记下来（{_tombstone_path()} 写不进去）。{COLOR_RESET}")
         print(f"    下次签到可能把这个账号重新存回列表。要彻底干净请在客户端里退出登录。")
-    elif is_active:
+    elif tombstoned and is_active:
         print(f"  ℹ 签到任务也不会再把它自动存回列表；等你主动 workbuddy login 重新登录，它才会被重新收录。")
+    elif tombstoned is None:
+        # 文件里没有任何身份信息，本来就不会被签到当成"新登录账号"存回去，无需提示
+        pass
 
     counts = _count_ownership_rows(uid)
     busy = " / ".join(f"{k} {v} 条" for k, v in counts.items() if v)
@@ -2577,7 +2625,9 @@ def run_login(alias=None, auto_switch=True, force=False):
     final_target_path = os.path.join(PROFILES_DIR, f"{final_alias}.info")
 
     atomic_write_json(final_target_path, profile_data)
-    _clear_tombstone(uid)
+    # 登录/保存 = 用户主动要这个账号，把它的所有墓碑键（uid/uin/token 指纹）一起解掉，
+    # 只解 uid 会留下 uin 和 token 键，导致这个账号永远被判成"已删除"。
+    _clear_tombstones(_tombstone_keys(profile_data, uid))
 
     cache = get_audit_cache()
     if uid:
@@ -3528,7 +3578,7 @@ def save_current(name, force=False):
     final_name, is_inplace = resolve_profile_alias_conflict(name, uid, force=force)
     target_path = os.path.join(PROFILES_DIR, f"{final_name}.info")
     atomic_write_json(target_path, active_data)
-    _clear_tombstone(uid)
+    _clear_tombstones(_tombstone_keys(active_data, uid))
     if is_inplace:
         print(f"{COLOR_GREEN}✔ 当前登录态已在位平滑更新至 Profile: '{final_name}' (昵称: {nickname}, UID: {uid}){COLOR_RESET}")
     else:
