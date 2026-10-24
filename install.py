@@ -343,7 +343,7 @@ def install_cli():
     if bin_dir not in path_env.split(os.pathsep):
         print(f"{COLOR_YELLOW}   [提示] {bin_dir} 暂不在当前 PATH 中，建议将其加入 ~/.bashrc 或 ~/.zshrc{COLOR_RESET}")
 
-    print(f"{COLOR_GREEN}1. ✔ CLI 工具已安装至: {bin_dir} (workbuddy, wb-help, wb-models, wb-router, wb-switch, wb-checkin){COLOR_RESET}")
+    print(f"{COLOR_GREEN}1. ✔ CLI 工具已安装至: {bin_dir} (workbuddy, wb-help, wb-models, wb-router, wb-switch, wb-rm, wb-checkin){COLOR_RESET}")
     return dest_bin, bin_dir
 
 

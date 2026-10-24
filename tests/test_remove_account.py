@@ -577,6 +577,97 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
         self.assertIn("用法", out)
         self.assertTrue(self._profile_exists("alice"))
 
+    def test_active_detected_when_fields_named_differently(self):
+        """一边写 userId、一边写 uid，是同一个账号，必须认出来。"""
+        os.makedirs(os.path.dirname(workbuddy.AUTH_FILE), exist_ok=True)
+        with open(os.path.join(workbuddy.PROFILES_DIR, "legacy.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": {"userId": "U1", "nickname": "老"}, "auth": {"accessToken": "T1"}}, f)
+        with open(workbuddy.AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": "U1", "nickname": "老"}, "auth": {"accessToken": "T2"}}, f)
+
+        with patch.object(sys.stdin, "isatty", return_value=False):
+            ok, _ = self._run(workbuddy.remove_profile, "legacy", yes=True)
+
+        self.assertFalse(ok, "profile 用 userId、登录态用 uid 时也必须认出是当前账号")
+        self.assertTrue(self._profile_exists("legacy"))
+
+    def test_active_detected_without_any_id_field(self):
+        """两边都没有 ID 字段时，靠同一个 accessToken 兜底。"""
+        body = {"account": {"nickname": "无ID"}, "auth": {"accessToken": "TOK-SAME"}}
+        os.makedirs(os.path.dirname(workbuddy.AUTH_FILE), exist_ok=True)
+        with open(os.path.join(workbuddy.PROFILES_DIR, "noid.info"), "w", encoding="utf-8") as f:
+            json.dump(body, f)
+        with open(workbuddy.AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump(body, f)
+
+        with patch.object(sys.stdin, "isatty", return_value=False):
+            ok, _ = self._run(workbuddy.remove_profile, "noid", yes=True)
+
+        self.assertFalse(ok, "同一个 accessToken 说明是同一个登录态")
+        self.assertTrue(self._profile_exists("noid"))
+
+    def test_duplicate_aliases_with_mixed_fields(self):
+        """同一账号的两个别名分别写 uid / userId 时，按 UID 删也必须判成多别名。"""
+        self._save_profile("dup1", "u1")
+        with open(os.path.join(workbuddy.PROFILES_DIR, "dup2.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": {"userId": "u1", "nickname": "dup2"}, "auth": {"accessToken": "T2"}}, f)
+        self._save_profile("other", "u2")
+        self._set_active("u2")
+
+        ok, out = self._run(workbuddy.remove_profile, "u1", yes=True)
+
+        self.assertFalse(ok)
+        self.assertTrue(self._profile_exists("dup1"))
+        self.assertTrue(self._profile_exists("dup2"))
+        self.assertIn("别名", out)
+
+    def test_uid_prefix_does_not_delete(self):
+        """删号不接受 UID 前缀猜测：打错一半不能变成误删。"""
+        self._save_profile("alice", "abcdef123456")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+
+        ok, out = self._run(workbuddy.remove_profile, "abcd", yes=True)
+
+        self.assertFalse(ok)
+        self.assertTrue(self._profile_exists("alice"))
+        self.assertIn("前缀", out)
+
+    def test_full_uid_deletes(self):
+        self._save_profile("alice", "abcdef123456")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+
+        ok, _ = self._run(workbuddy.remove_profile, "abcdef123456", yes=True)
+
+        self.assertTrue(ok)
+        self.assertFalse(self._profile_exists("alice"))
+
+    def test_restore_rejects_broken_backup(self):
+        trash = os.path.join(workbuddy.PROFILES_DIR, ".trash")
+        os.makedirs(trash, exist_ok=True)
+        with open(os.path.join(trash, "broken.20260101-000000.info"), "w", encoding="utf-8") as f:
+            f.write("{not json")
+
+        ok, out = self._run(workbuddy.restore_profile, "broken")
+
+        self.assertFalse(ok)
+        self.assertFalse(self._profile_exists("broken"), "坏备份不能被塞进账号目录")
+        self.assertIn("损坏", out)
+
+    def test_empty_trash_with_target_rejected(self):
+        """--purge 写成 --empty-trash 还带账号名时，不能默默清空整个回收站。"""
+        self._save_profile("alice", "uid_alice")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+        workbuddy.remove_profile("alice", yes=True)
+
+        code, out = self._run(workbuddy.run_remove_cmd, ["--empty-trash", "bob", "-y"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self._trash_files()), 1, "回收站不该被清空")
+        self.assertIn("不接受账号名", out)
+
     def test_switch_still_works_after_removal(self):
         """验收 B：删完号，剩下的账号还得能正常切。"""
         self._save_profile("alice", "uid_alice")
@@ -603,9 +694,11 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
         os.makedirs(auth_dir, exist_ok=True)
         for alias, uid in (("alice", "uid_alice"), ("bob", "uid_bob")):
             with open(os.path.join(profiles, f"{alias}.info"), "w", encoding="utf-8") as f:
-                json.dump({"account": {"uid": uid, "nickname": alias}, "auth": {"accessToken": "t"}}, f)
+                json.dump({"account": {"uid": uid, "nickname": alias},
+                           "auth": {"accessToken": f"t-{alias}"}}, f)
         with open(os.path.join(auth_dir, "workbuddy-desktop.info"), "w", encoding="utf-8") as f:
-            json.dump({"account": {"uid": "uid_bob", "nickname": "bob"}, "auth": {"accessToken": "t"}}, f)
+            json.dump({"account": {"uid": "uid_bob", "nickname": "bob"},
+                       "auth": {"accessToken": "t-bob"}}, f)
         env = os.environ.copy()
         env.update({
             "HOME": home,

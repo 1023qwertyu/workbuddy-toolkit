@@ -1030,20 +1030,46 @@ def _stdin_is_tty():
 def _profile_identity(data):
     """从一份凭证 JSON 里取出可比对的账号身份。
 
-    老版本账号文件里 UID 可能写在 account.userId 或顶层，只认 account.uid 会让
-    "当前正在使用的账号"判断失效（于是 -y 能静默删掉正在用的号），所以这里三种都收。
+    两个坑都要绕开：
+      1. 老数据把 UID 写在 account.userId（本仓库自己也把它归一成 uid），
+         所以 uid / userId 必须算同一类，不能按字段名分开比对；
+      2. 有的老文件干脆没有任何 ID 字段，那就靠 accessToken 兜底（见 _same_access_token）。
     """
     keys = set()
     if not isinstance(data, dict):
         return keys
     acc = data.get("account") if isinstance(data.get("account"), dict) else {}
-    for field in ("uid", "userId", "uin"):
-        for holder in (acc, data):
-            val = holder.get(field) if isinstance(holder, dict) else None
-            if val is None or str(val).strip() == "":
-                continue
-            keys.add(f"{field}:{str(val).strip()}")
+    for holder in (acc, data):
+        if not isinstance(holder, dict):
+            continue
+        for field in ("uid", "userId"):
+            val = holder.get(field)
+            if val is not None and str(val).strip():
+                keys.add(f"uid:{str(val).strip()}")
+        uin = holder.get("uin")
+        if uin is not None and str(uin).strip():
+            keys.add(f"uin:{str(uin).strip()}")
     return keys
+
+def _get_access_token(data):
+    if not isinstance(data, dict):
+        return ""
+    auth = data.get("auth")
+    if isinstance(auth, dict):
+        return str(auth.get("accessToken") or "").strip()
+    return ""
+
+def _same_access_token(a, b):
+    """没有任何 ID 字段可比时，同一个 accessToken 就说明是同一个登录态。"""
+    ta, tb = _get_access_token(a), _get_access_token(b)
+    return bool(ta and tb and ta == tb)
+
+def _is_same_account(a, b):
+    """两份凭证是不是同一个账号：两边都有 ID 就比 ID，任一边缺 ID 才退回比 token。"""
+    keys_a, keys_b = _profile_identity(a), _profile_identity(b)
+    if keys_a and keys_b:
+        return bool(keys_a & keys_b)
+    return _same_access_token(a, b)
 
 def _confirm_removal(prompt_text):
     """只在交互式终端里问。管道、cron、agent 调用一律当作"没确认"。"""
@@ -1083,6 +1109,16 @@ def restore_profile(query):
     if os.path.exists(target_path):
         print(f"{COLOR_RED}错误: 账号 '{entry['alias']}' 已经存在，恢复会覆盖它，已中止。{COLOR_RESET}")
         print(f"  现有文件: {target_path}")
+        return False
+    # 备份文件可能是被外部改坏/截断的，先验一下再放回去，别把坏文件塞进账号目录
+    try:
+        with open(entry["path"], "r", encoding="utf-8") as f:
+            content = json.load(f)
+        if not isinstance(content, dict) or not content:
+            raise ValueError("内容不是账号 JSON")
+    except Exception as exc:
+        print(f"{COLOR_RED}错误: 回收站里的备份已损坏（{exc}），已中止恢复。{COLOR_RESET}")
+        print(f"  文件: {entry['path']}")
         return False
     os.makedirs(PROFILES_DIR, exist_ok=True)
     os.replace(entry["path"], target_path)
@@ -1124,22 +1160,26 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
     if not profiles:
         print(f"{COLOR_YELLOW}未在 {PROFILES_DIR} 中发现任何保存的账号，无需删除。{COLOR_RESET}")
         return False
-    name, target = resolve_profile_target(profiles, query)
+    name, target = resolve_profile_target(profiles, query, allow_uid_prefix=False)
     if not target:
-        print(f"{COLOR_RED}错误: 未找到唯一匹配 '{query}' 的账号。{COLOR_RESET}")
+        # 删号是破坏性操作，不接受 UID 前缀这种"猜"出来的匹配
+        prefix_hit, _ = resolve_profile_target(profiles, query, allow_uid_prefix=True, quiet=True)
+        print(f"{COLOR_RED}错误: 未找到精确匹配 '{query}' 的账号。{COLOR_RESET}")
+        if prefix_hit:
+            print(f"  它看起来是 UID 前缀（对应 '{prefix_hit}'），删除请写完整 UID 或别名。")
         print("可用账号: " + ", ".join(profiles.keys()))
         return False
 
     uid = str(target.get("uid") or "").strip()
-    target_keys = _profile_identity(target.get("data"))
-    active_keys = _profile_identity(get_active_account())
-    is_active = bool(target_keys & active_keys)
+    target_data = target.get("data")
+    active_data = get_active_account()
+    is_active = _is_same_account(target_data, active_data)
     prof_path = target.get("path") or os.path.join(PROFILES_DIR, f"{name}.info")
 
     # 同一个账号可能挂在多个别名下（老数据、手工复制都常见）。按 UID / 昵称这种"非别名"输入删，
     # 实际只删掉其中一个别名，用户会以为整个账号没了 —— 这种输入直接拒绝，要求按别名删。
     siblings = [n for n, p in profiles.items()
-                if n != name and target_keys & _profile_identity(p.get("data"))]
+                if n != name and _is_same_account(p.get("data"), target_data)]
     query_is_alias = str(query or "").strip().lower() == name.lower()
     if siblings and not query_is_alias:
         print(f"{COLOR_RED}错误: '{query}' 对应 {1 + len(siblings)} 个别名: {name}, {', '.join(siblings)}{COLOR_RESET}")
@@ -1296,6 +1336,11 @@ def run_remove_cmd(args):
             return 1
         positional.append(a)
         i += 1
+
+    if positional and ("--list-trash" in args or "--empty-trash" in args or restore_arg is not None):
+        # 防手滑：把 --purge 误写成 --empty-trash 还带着账号名时，别默默清空整个回收站
+        print(f"{COLOR_RED}该模式不接受账号名，收到: {', '.join(positional)}{COLOR_RESET}")
+        return 1
 
     if "--list-trash" in args:
         show_trash()
