@@ -25,6 +25,7 @@ import urllib.error
 import re
 import shutil
 import base64
+import hashlib
 import unicodedata
 import random
 import webbrowser
@@ -833,7 +834,8 @@ def get_profiles():
                     # UID 可能写在 account.uid / account.userId / 顶层（老数据），都要认，
                     # 否则按 UID 定位账号在老账号文件上会"找不到"。
                     uid_raw = acc.get("uid") or acc.get("userId") or data.get("uid") or data.get("userId")
-                    if isinstance(uid_raw, str) and is_encrypted_credential(uid_raw):
+                    if not isinstance(uid_raw, str):
+                        # uid 正常是字符串；万一被写成对象（例如加密信封）就不要当身份用
                         uid_raw = ""
                     uid_str = str(uid_raw).strip() if uid_raw is not None else ""
                     uin_raw = acc.get("uin") if isinstance(acc, dict) else ""
@@ -983,8 +985,16 @@ def list_trashed_profiles():
         items.append({"file": fname, "alias": alias, "saved_at": stamp, "path": fpath, "mtime": mtime})
     # 按删除时间（文件名里的时间戳）排，新的在前。不能用文件 mtime：
     # os.replace 会保留原文件的修改时间，按 mtime 排等于按"账号最后被写过"排，会恢复错的那份。
-    items.sort(key=lambda x: (x["saved_at"] or "", x["file"]), reverse=True)
+    items.sort(key=lambda x: (_stamp_sort_key(x["saved_at"]), x["file"]), reverse=True)
     return items
+
+def _stamp_sort_key(stamp):
+    """把 20261024-142331 这类时间戳变成可比较的整数；脏值统一当 0，不让排序抛异常。"""
+    digits = re.sub(r"\D", "", str(stamp or ""))
+    try:
+        return int(digits) if digits else 0
+    except ValueError:
+        return 0
 
 DELETED_MARKER_NAME = "deleted.json"
 TOMBSTONE_LIMIT = 200
@@ -1001,43 +1011,129 @@ def _load_tombstones():
         return {}
 
 def _save_tombstones(marks):
+    """写墓碑表，返回是否真的落盘成功（失败要能被上层发现，不能默默假成功）。"""
     # 只留最近的若干条，避免这个文件无界增长
     if len(marks) > TOMBSTONE_LIMIT:
-        kept = sorted(marks.items(), key=lambda kv: kv[1])[-TOMBSTONE_LIMIT:]
+        kept = sorted(marks.items(), key=lambda kv: _stamp_sort_key(kv[1]))[-TOMBSTONE_LIMIT:]
         marks = dict(kept)
     try:
         os.makedirs(get_trash_dir(), exist_ok=True)
         atomic_write_json(_tombstone_path(), marks)
+        return True
     except Exception:
+        return False
+
+def _tombstone_lock():
+    """跨进程串行化墓碑读改写：两个终端同时删号时，不加锁会互相覆盖丢记录。"""
+    lock_path = _tombstone_path() + ".lock"
+    try:
+        os.makedirs(get_trash_dir(), exist_ok=True)
+    except OSError:
+        pass
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            return fd, lock_path
+        except FileExistsError:
+            time.sleep(0.02)
+        except OSError:
+            # 目录还没建好之类，稍等重试，不要直接放弃加锁
+            time.sleep(0.02)
+    # 超时按"上次崩溃留下的僵尸锁"处理：清掉再抢一次，抢不到就退化成不加锁
+    try:
+        os.remove(lock_path)
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        return fd, lock_path
+    except OSError:
+        return None, lock_path
+
+def _tombstone_unlock(fd, lock_path):
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        os.remove(lock_path)
+    except OSError:
         pass
 
+def _token_fingerprint(data):
+    """token 的指纹（只存哈希前缀，不落明文），用于没有 ID 字段的老账号文件。"""
+    token = _get_access_token(data)
+    if not token:
+        return ""
+    return "tok:" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+def _tombstone_keys(data, uid=""):
+    """一个账号在墓碑表里的所有别名键：身份值 + token 指纹。
+
+    只按 uid 记会漏：老文件可能只有 uin、甚至什么 ID 都没有，
+    那样 uid 是空的，删完不记墓碑，第二天签到又把账号存回列表。
+    """
+    keys = set(_profile_identity(data))
+    if uid and str(uid).strip():
+        keys.add(str(uid).strip())
+    fp = _token_fingerprint(data)
+    if fp:
+        keys.add(fp)
+    return keys
+
+def _record_tombstones(keys):
+    """把若干个键记为"用户手动删过"，返回是否落盘成功。"""
+    keys = {str(k).strip() for k in (keys or []) if str(k).strip()}
+    if not keys:
+        return False
+    fd, lock_path = _tombstone_lock()
+    try:
+        marks = _load_tombstones()
+        ts = time.time()
+        for k in keys:
+            marks[k] = ts
+        return _save_tombstones(marks)
+    finally:
+        _tombstone_unlock(fd, lock_path)
+
 def _record_tombstone(uid):
-    """记一笔"这个账号是用户手动删的"，供签到任务判断要不要自动收录。"""
-    if not uid:
+    return _record_tombstones({uid} if uid else set())
+
+def _clear_tombstones(keys):
+    keys = {str(k).strip() for k in (keys or []) if str(k).strip()}
+    if not keys:
         return
-    marks = _load_tombstones()
-    marks[str(uid)] = time.time()
-    _save_tombstones(marks)
+    fd, lock_path = _tombstone_lock()
+    try:
+        marks = _load_tombstones()
+        hit = [k for k in keys if k in marks]
+        if not hit:
+            return
+        for k in hit:
+            marks.pop(k, None)
+        _save_tombstones(marks)
+    finally:
+        _tombstone_unlock(fd, lock_path)
 
 def _clear_tombstone(uid):
-    """用户主动重新登录 / 保存这个账号时解除标记。"""
-    if not uid:
-        return
-    marks = _load_tombstones()
-    if str(uid) in marks:
-        marks.pop(str(uid), None)
-        _save_tombstones(marks)
+    _clear_tombstones({uid} if uid else set())
 
-def _is_tombstoned(uid):
-    """这个 UID 是不是被用户手动删过、之后又没主动登录回来。
+def _is_tombstoned(data):
+    """这个账号是不是被用户手动删过、之后又没主动登录回来。
+
+    参数可以是凭证 dict（推荐，身份值 + token 指纹全查），也可以是单个 uid 字符串。
 
     不能用"登录态文件有没有被改过"来判断：客户端每隔约 2 小时刷新一次 token 会
     回写这个文件，那样标记撑不过两个小时，"删了又回来"照样发生。
-    所以只有用户显式执行 login / save（这两个入口会清标记）才算重新要这个账号。
+    所以只有用户显式执行 login / save / rm --restore（这几处会清标记）才算要回这个账号。
     """
-    if not uid:
+    if isinstance(data, str):
+        keys = {data} if data.strip() else set()
+    else:
+        keys = _tombstone_keys(data)
+    if not keys:
         return False
-    return str(uid) in _load_tombstones()
+    marks = _load_tombstones()
+    return any(k in marks for k in keys)
 
 def _resolve_trash_entry(query):
     """按回收站文件名或原别名找一条记录（别名可能有多条，取最近删除的那份）。"""
@@ -1140,7 +1236,9 @@ def _display_name_key(data):
 def _is_same_account(a, b):
     """两份凭证是不是同一个账号：两边都有 ID 就比 ID，否则退回 token / 昵称。
 
-    误判方向是安全的：多认成"同一个账号"只会让删除更谨慎（停下来问人）。
+    已知边界（能力上限，不是 bug）：两份文件用了完全不同的 ID 字段、昵称还被改过时
+    （例如 profile 只有 uid、登录态只有 uin、昵称也不一样），这里判不出来，会按
+    "不是当前账号"处理。删当前账号前先 workbuddy switch 到别的号，可以绕开这个边界。
     """
     keys_a, keys_b = _profile_identity(a), _profile_identity(b)
     if keys_a and keys_b:
@@ -1204,6 +1302,8 @@ def restore_profile(query):
         return False
     os.makedirs(PROFILES_DIR, exist_ok=True)
     os.replace(entry["path"], target_path)
+    # 恢复 = "我要这个账号回来"，把墓碑一起解掉，否则客户端哪天重置登录态它就再也收不回来
+    _clear_tombstones(_tombstone_keys(content))
     print(f"{COLOR_GREEN}✔ 已恢复账号 '{entry['alias']}' → {target_path}{COLOR_RESET}")
     print(f"  要切过去: {COLOR_BOLD}workbuddy switch {entry['alias']}{COLOR_RESET}")
     return True
@@ -1391,7 +1491,8 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
         except OSError as exc:
             print(f"{COLOR_RED}删除失败: {exc}{COLOR_RESET}")
             return False
-        print(f"{COLOR_GREEN}✔ 已永久删除账号 '{name}'（不可恢复）。{COLOR_RESET}")
+        suffix = f"；账号本体仍在 {', '.join(siblings)} 下" if siblings else ""
+        print(f"{COLOR_GREEN}✔ 已永久删除别名 '{name}'{suffix}（不可恢复）。{COLOR_RESET}")
     else:
         trash_dir = get_trash_dir()
         try:
@@ -1406,20 +1507,27 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
         except OSError as exc:
             print(f"{COLOR_RED}删除失败，账号文件未改动: {exc}{COLOR_RESET}")
             return False
-        print(f"{COLOR_GREEN}✔ 已删除账号 '{name}'，文件已移入回收站。{COLOR_RESET}")
+        suffix = f"（账号本体仍在 {', '.join(siblings)} 下）" if siblings else ""
+        print(f"{COLOR_GREEN}✔ 已删除别名 '{name}'，文件已移入回收站{suffix}。{COLOR_RESET}")
         print(f"  回收站: {dest_path}")
 
+    # 记一笔：签到任务别把"用户刚删掉的这个号"又自动存回列表。
+    # 必须用身份值 + token 指纹一起记：老文件可能只有 uin、甚至没有任何 ID，
+    # 只按 uid 记会出现"uid 为空 → 没记墓碑 → 第二天签到把号存回来"。
+    tombstoned = _record_tombstones(_tombstone_keys(target_data, uid))
     if uid:
         cache = get_audit_cache()
         if uid in cache:
             cache.pop(uid, None)
             save_audit_cache(cache)
             print(f"  ✔ 已清掉体检缓存里该账号的记录")
-        # 记一笔：签到任务别把"用户刚删掉的这个号"又自动存回列表
-        _record_tombstone(uid)
     if is_active:
         print(f"  ℹ 客户端的登录态没动，所以状态页仍会把这号显示为当前账号——这是预期，不是残留。")
-        print(f"  ℹ 签到任务也不会再把它自动存回列表；等你哪天重新登录这个账号，它才会重新被收录。")
+        if tombstoned:
+            print(f"  ℹ 签到任务也不会再把它自动存回列表；等你主动 workbuddy login 重新登录，它才会被重新收录。")
+        else:
+            print(f"{COLOR_YELLOW}  ▲ 但没能把\"已删除\"这个状态记下来（{_tombstone_path()} 写不进去），{COLOR_RESET}")
+            print(f"    下次签到可能把这个账号重新存回列表。要彻底干净请在客户端里退出登录。")
 
     counts = _count_ownership_rows(uid)
     busy = " / ".join(f"{k} {v} 条" for k, v in counts.items() if v)
@@ -3170,7 +3278,7 @@ def _auto_import_active_profile(active_data, profiles):
     active_uid = acc.get("uid") if isinstance(acc, dict) else None
     if not active_uid or any(p["uid"] == active_uid for p in profiles.values()):
         return profiles
-    if _is_tombstoned(active_uid):
+    if _is_tombstoned(active_data):
         print(f"{COLOR_YELLOW}ℹ 当前登录的账号 ({mask_uid(active_uid)}) 已被手动删除，跳过自动收录。{COLOR_RESET}")
         print(f"  要重新要回这个账号，执行 workbuddy login 重新登录即可；要彻底退出请在客户端里退出登录。")
         return profiles

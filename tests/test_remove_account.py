@@ -849,6 +849,95 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
         uids = [p["uid"] for p in workbuddy.get_profiles().values()]
         self.assertIn("uid_bob", uids, "主动重新登录后应恢复正常收录")
 
+    def test_uin_only_active_account_not_reimported(self):
+        """只有 uin 的老文件删完也要记墓碑，否则第二天签到把号存回来（第六轮审查的 P1）。"""
+        with open(os.path.join(workbuddy.PROFILES_DIR, "old.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": {"uin": "111222", "nickname": "老账号"}}, f)
+        os.makedirs(os.path.dirname(workbuddy.AUTH_FILE), exist_ok=True)
+        with open(workbuddy.AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": "U-real-777", "uin": "111222"}, "auth": {"accessToken": "T-old"}}, f)
+        self._save_profile("keep", "uid_keep")
+
+        ok, _ = self._run(workbuddy.remove_profile, "old", yes=True, force_active=True)
+        self.assertTrue(ok)
+
+        workbuddy._auto_import_active_profile(workbuddy.get_active_account(), workbuddy.get_profiles())
+
+        self.assertNotIn("老账号", workbuddy.get_profiles(), "只有 uin 的账号也不能被签到存回来")
+        self.assertEqual(sorted(workbuddy.get_profiles().keys()), ["keep"])
+
+    def test_no_id_active_account_not_reimported(self):
+        """连 ID 都没有的当前账号，靠 token 指纹记墓碑，签到同样不能存回来。"""
+        body = {"account": {"nickname": "无名"}, "auth": {"accessToken": "TOK-NOID"}}
+        with open(os.path.join(workbuddy.PROFILES_DIR, "noid.info"), "w", encoding="utf-8") as f:
+            json.dump(body, f)
+        self._save_profile("keep", "uid_keep")
+        os.makedirs(os.path.dirname(workbuddy.AUTH_FILE), exist_ok=True)
+        with open(workbuddy.AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump(body, f)
+
+        ok, _ = self._run(workbuddy.remove_profile, "noid", yes=True, force_active=True)
+        self.assertTrue(ok)
+
+        workbuddy._auto_import_active_profile(workbuddy.get_active_account(), workbuddy.get_profiles())
+
+        self.assertNotIn("无名", workbuddy.get_profiles())
+
+    def test_tombstone_write_failure_is_reported(self):
+        """墓碑写不进去时不能假装"签到不会再存回来"。"""
+        self._save_profile("alice", "uid_alice")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+
+        with patch.object(workbuddy, "_save_tombstones", return_value=False):
+            ok, out = self._run(workbuddy.remove_profile, "bob", yes=True, force_active=True)
+
+        self.assertTrue(ok)
+        self.assertIn("没能", out)
+        self.assertNotIn("不会再把它自动存回列表", out)
+
+    def test_restore_clears_tombstone(self):
+        self._save_profile("alice", "uid_alice")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+        workbuddy.remove_profile("bob", yes=True, force_active=True)
+        self.assertTrue(workbuddy._is_tombstoned("uid_bob"))
+
+        ok, _ = self._run(workbuddy.restore_profile, "bob")
+
+        self.assertTrue(ok)
+        self.assertFalse(workbuddy._is_tombstoned("uid_bob"), "恢复就是'我要这个账号回来'，标记要解掉")
+
+    def test_concurrent_tombstones_are_not_lost(self):
+        """多进程/多线程同时删号时，墓碑读改写要串行，不能互相覆盖。"""
+        from concurrent.futures import ThreadPoolExecutor
+
+        keys = [f"U-conc-{i}" for i in range(8)]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda k: workbuddy._record_tombstones({k}), keys))
+
+        marks = workbuddy._load_tombstones()
+        for k in keys:
+            self.assertIn(k, marks, f"{k} 的墓碑被并发覆盖丢了")
+
+    def test_dirty_tombstone_file_does_not_crash(self):
+        """deleted.json 里混进非数字时间戳、且超过上限时，删除不能崩。"""
+        trash = os.path.join(workbuddy.PROFILES_DIR, ".trash")
+        os.makedirs(trash, exist_ok=True)
+        dirty = {f"old-{i}": 1700000000 + i for i in range(200)}
+        dirty["legacy-key"] = "not-a-number"
+        with open(os.path.join(trash, "deleted.json"), "w", encoding="utf-8") as f:
+            json.dump(dirty, f)
+        self._save_profile("alice", "uid_alice")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+
+        ok, _ = self._run(workbuddy.remove_profile, "alice", yes=True)
+
+        self.assertTrue(ok)
+        self.assertFalse(self._profile_exists("alice"))
+        self.assertLessEqual(len(workbuddy._load_tombstones()), workbuddy.TOMBSTONE_LIMIT)
+
     def test_switch_still_works_after_removal(self):
         """验收 B：删完号，剩下的账号还得能正常切。"""
         self._save_profile("alice", "uid_alice")
