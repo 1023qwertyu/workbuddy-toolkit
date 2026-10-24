@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -79,7 +80,8 @@ class _SandboxMixin:
         d = os.path.join(workbuddy.PROFILES_DIR, ".trash")
         if not os.path.isdir(d):
             return []
-        return sorted(os.listdir(d))
+        # 回收站里还有 removed 标记文件（deleted.json），只数账号备份
+        return sorted(f for f in os.listdir(d) if f.endswith(".info"))
 
     def _run(self, func, *args, **kwargs):
         buf = io.StringIO()
@@ -140,7 +142,7 @@ class TestRemoveAccount(_SandboxMixin, unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(self._profile_exists("alice"))
         self.assertEqual(self._trash_files(), [])
-        self.assertIn("未找到", out)
+        self.assertIn("没有唯一匹配", out)
 
     # ---------- 活跃账号保护 ----------
 
@@ -668,6 +670,99 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
         self.assertEqual(len(self._trash_files()), 1, "回收站不该被清空")
         self.assertIn("不接受账号名", out)
 
+    def test_active_detected_when_uid_and_uin_are_the_fields(self):
+        """一侧只有 uid、另一侧只有 uin，值相同就该认成同一个账号（删号宁严勿松）。"""
+        self._save_profile("alice", "123456")
+        os.makedirs(os.path.dirname(workbuddy.AUTH_FILE), exist_ok=True)
+        with open(workbuddy.AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uin": "123456", "nickname": "alice"}, "auth": {"accessToken": "T9"}}, f)
+
+        with patch.object(sys.stdin, "isatty", return_value=False):
+            ok, _ = self._run(workbuddy.remove_profile, "alice", yes=True)
+
+        self.assertFalse(ok, "uid 与 uin 值相同时应判为当前账号")
+        self.assertTrue(self._profile_exists("alice"))
+
+    def test_uid_lookup_works_on_legacy_userid_profile(self):
+        """老账号文件把 UID 写在 account.userId，按这个 UID 也要能删。"""
+        with open(os.path.join(workbuddy.PROFILES_DIR, "legacy.info"), "w", encoding="utf-8") as f:
+            json.dump({"account": {"userId": "U-LEGACY-1", "nickname": "老数据"},
+                       "auth": {"accessToken": "T1"}}, f)
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+
+        ok, _ = self._run(workbuddy.remove_profile, "U-LEGACY-1", yes=True)
+
+        self.assertTrue(ok)
+        self.assertFalse(self._profile_exists("legacy"))
+
+    def test_uid_is_masked_in_output(self):
+        long_uid = "abcdef1234567890"
+        self._save_profile("alice", long_uid)
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+
+        _, out = self._run(workbuddy.remove_profile, "alice", yes=True)
+
+        self.assertNotIn(long_uid, out, "输出里的 UID 应与 status 一样做掩码")
+        self.assertIn(long_uid[:8], out)
+
+    def test_broken_profile_can_be_removed_by_alias(self):
+        """坏 JSON 的账号文件列表里看不到，但也得能被删掉，不能变成清不掉的死文件。"""
+        broken = os.path.join(workbuddy.PROFILES_DIR, "broken.info")
+        with open(broken, "w", encoding="utf-8") as f:
+            f.write("{not json")
+
+        ok, out = self._run(workbuddy.remove_profile, "broken", yes=True)
+
+        self.assertTrue(ok)
+        self.assertFalse(os.path.exists(broken))
+        self.assertEqual(len(self._trash_files()), 1)
+        self.assertIn("损坏", out)
+
+    def test_restore_rejects_non_credential_json(self):
+        trash = os.path.join(workbuddy.PROFILES_DIR, ".trash")
+        os.makedirs(trash, exist_ok=True)
+        with open(os.path.join(trash, "junk.20260101-000000.info"), "w", encoding="utf-8") as f:
+            json.dump({"hello": "world"}, f)
+
+        ok, out = self._run(workbuddy.restore_profile, "junk")
+
+        self.assertFalse(ok)
+        self.assertFalse(self._profile_exists("junk"))
+        self.assertIn("损坏", out)
+
+    # ---------- 签到不能把删掉的号存回来 ----------
+
+    def test_checkin_does_not_reimport_deleted_active_account(self):
+        self._save_profile("alice", "uid_alice")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+
+        ok, _ = self._run(workbuddy.remove_profile, "bob", yes=True, force_active=True)
+        self.assertTrue(ok)
+
+        profiles = workbuddy.get_profiles()
+        _, out = self._run(workbuddy._auto_import_active_profile, workbuddy.get_active_account(), profiles)
+
+        self.assertEqual(sorted(workbuddy.get_profiles().keys()), ["alice"], "签到不能把刚删掉的号自动存回来")
+        self.assertIn("跳过自动收录", out)
+
+    def test_checkin_reimports_after_relogin(self):
+        """用户重新登录（登录态文件被刷新）后，就允许重新收录了。"""
+        self._save_profile("alice", "uid_alice")
+        self._save_profile("bob", "uid_bob")
+        self._set_active("uid_bob")
+        workbuddy.remove_profile("bob", yes=True, force_active=True)
+
+        future = time.time() + 60
+        os.utime(workbuddy.AUTH_FILE, (future, future))
+        profiles = workbuddy.get_profiles()
+        workbuddy._auto_import_active_profile(workbuddy.get_active_account(), profiles)
+
+        uids = [p["uid"] for p in workbuddy.get_profiles().values()]
+        self.assertIn("uid_bob", uids, "重新登录后应恢复正常收录")
+
     def test_switch_still_works_after_removal(self):
         """验收 B：删完号，剩下的账号还得能正常切。"""
         self._save_profile("alice", "uid_alice")
@@ -721,7 +816,7 @@ class TestRemoveCommandCli(_SandboxMixin, unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(profiles, "alice.info")))
         self.assertTrue(os.path.exists(os.path.join(profiles, "bob.info")))
         trash = os.path.join(profiles, ".trash")
-        self.assertEqual(len(os.listdir(trash)), 1)
+        self.assertEqual(len([f for f in os.listdir(trash) if f.endswith(".info")]), 1)
 
     def test_main_dispatch_blocks_active_account(self):
         home, profiles, env = self._make_home_layout()

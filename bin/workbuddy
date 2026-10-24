@@ -828,7 +828,11 @@ def get_profiles():
                     data = json.load(f)
                     acc = data.get("account", {}) if isinstance(data, dict) else {}
                     nick = get_display_nickname(acc, default_name=name)
-                    uid_raw = acc.get("uid") if isinstance(acc, dict) else ""
+                    # UID 可能写在 account.uid / account.userId / 顶层（老数据），都要认，
+                    # 否则按 UID 定位账号在老账号文件上会"找不到"。
+                    uid_raw = acc.get("uid") or acc.get("userId") or data.get("uid") or data.get("userId")
+                    if isinstance(uid_raw, str) and is_encrypted_credential(uid_raw):
+                        uid_raw = ""
                     uid_str = str(uid_raw).strip() if uid_raw is not None else ""
                     uin_raw = acc.get("uin") if isinstance(acc, dict) else ""
                     uin_str = str(uin_raw).strip() if uin_raw is not None else ""
@@ -978,6 +982,49 @@ def list_trashed_profiles():
     items.sort(key=lambda x: x["mtime"], reverse=True)
     return items
 
+DELETED_MARKER_NAME = "deleted.json"
+
+def _tombstone_path():
+    return os.path.join(get_trash_dir(), DELETED_MARKER_NAME)
+
+def _load_tombstones():
+    try:
+        with open(_tombstone_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _record_tombstone(uid):
+    """记一笔"这个账号是用户手动删的"，供签到任务判断要不要自动收录。"""
+    if not uid:
+        return
+    marks = _load_tombstones()
+    marks[str(uid)] = time.time()
+    try:
+        os.makedirs(get_trash_dir(), exist_ok=True)
+        atomic_write_json(_tombstone_path(), marks)
+    except Exception:
+        pass
+
+def _deleted_recently(uid):
+    """这个 UID 是不是刚被手动删过、且登录态还停在那次登录上。
+
+    用文件时间判断：登录态文件的 mtime 早于删除时间 → 还是同一份登录，
+    签到任务不该把它自动存回账号列表；用户重新登录会刷新登录态文件，之后就允许收录。
+    """
+    if not uid:
+        return False
+    ts = _load_tombstones().get(str(uid))
+    if not ts:
+        return False
+    try:
+        if os.path.exists(AUTH_FILE) and os.path.getmtime(AUTH_FILE) > float(ts):
+            return False
+    except (OSError, TypeError, ValueError):
+        pass
+    return True
+
 def _resolve_trash_entry(query):
     """按回收站文件名或原别名找一条记录（别名可能有多条，取最近删除的那份）。"""
     q = str(query or "").strip().lower()
@@ -1028,12 +1075,15 @@ def _stdin_is_tty():
         return False
 
 def _profile_identity(data):
-    """从一份凭证 JSON 里取出可比对的账号身份。
+    """从一份凭证 JSON 里取出账号身份值（uid / userId / uin 一律平权）。
 
     两个坑都要绕开：
       1. 老数据把 UID 写在 account.userId（本仓库自己也把它归一成 uid），
-         所以 uid / userId 必须算同一类，不能按字段名分开比对；
+         有的文件只有 uin，所以不能按字段名分组比对，否则"当前正在用的账号"判不出来；
       2. 有的老文件干脆没有任何 ID 字段，那就靠 accessToken 兜底（见 _same_access_token）。
+
+    误判方向是安全的：多认成"同一个账号"只会让删除更谨慎（停下来问人），
+    不会反过来把不相干的账号当成活跃账号去删。
     """
     keys = set()
     if not isinstance(data, dict):
@@ -1042,13 +1092,10 @@ def _profile_identity(data):
     for holder in (acc, data):
         if not isinstance(holder, dict):
             continue
-        for field in ("uid", "userId"):
+        for field in ("uid", "userId", "uin"):
             val = holder.get(field)
             if val is not None and str(val).strip():
-                keys.add(f"uid:{str(val).strip()}")
-        uin = holder.get("uin")
-        if uin is not None and str(uin).strip():
-            keys.add(f"uin:{str(uin).strip()}")
+                keys.add(str(val).strip())
     return keys
 
 def _get_access_token(data):
@@ -1114,8 +1161,10 @@ def restore_profile(query):
     try:
         with open(entry["path"], "r", encoding="utf-8") as f:
             content = json.load(f)
-        if not isinstance(content, dict) or not content:
-            raise ValueError("内容不是账号 JSON")
+        if not isinstance(content, dict) or not (
+            isinstance(content.get("account"), dict) or isinstance(content.get("auth"), dict)
+        ):
+            raise ValueError("内容不是账号 JSON（既没有 account 也没有 auth）")
     except Exception as exc:
         print(f"{COLOR_RED}错误: 回收站里的备份已损坏（{exc}），已中止恢复。{COLOR_RESET}")
         print(f"  文件: {entry['path']}")
@@ -1147,6 +1196,32 @@ def empty_trash(yes=False):
     print(f"{COLOR_GREEN}✔ 已清空 {removed}/{len(entries)} 个文件。{COLOR_RESET}")
     return removed == len(entries)
 
+def mask_uid(uid):
+    """和 status 的展示策略保持一致：UID 只露前 8 位，别在日志里留全量身份串。"""
+    u = str(uid or "").strip()
+    if not u:
+        return "(未知)"
+    return u if len(u) <= 8 else f"{u[:8]}..."
+
+def _broken_profile_path(query):
+    """别名对应的 .info 还在、但内容解析不了（坏 JSON）时返回它的路径。
+
+    get_profiles() 对解析失败的文件是静默跳过的，所以这种文件不会出现在任何
+    列表里，用户也就没有任何命令能删掉它 —— 这里给它留一条按别名删除的路。
+    """
+    q = str(query or "").strip()
+    if not q or os.path.basename(q) != q or q.startswith("."):
+        return None
+    path = os.path.join(PROFILES_DIR, f"{q}.info")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            json.load(f)
+        return None
+    except Exception:
+        return path
+
 def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_active=False):
     """删除一个已保存的账号。默认移入回收站，--purge 才真删。
 
@@ -1157,18 +1232,30 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
       3. 本地库里该账号的历史归属记录只统计、不修改，免得删一个号影响别的号的历史。
     """
     profiles = get_profiles()
-    if not profiles:
-        print(f"{COLOR_YELLOW}未在 {PROFILES_DIR} 中发现任何保存的账号，无需删除。{COLOR_RESET}")
-        return False
-    name, target = resolve_profile_target(profiles, query, allow_uid_prefix=False)
+    target = None
+    name = ""
+    if profiles:
+        name, target = resolve_profile_target(profiles, query, allow_uid_prefix=False)
     if not target:
-        # 删号是破坏性操作，不接受 UID 前缀这种"猜"出来的匹配
-        prefix_hit, _ = resolve_profile_target(profiles, query, allow_uid_prefix=True, quiet=True)
-        print(f"{COLOR_RED}错误: 未找到精确匹配 '{query}' 的账号。{COLOR_RESET}")
-        if prefix_hit:
-            print(f"  它看起来是 UID 前缀（对应 '{prefix_hit}'），删除请写完整 UID 或别名。")
-        print("可用账号: " + ", ".join(profiles.keys()))
-        return False
+        # 兜底：别名对应的文件还在，但内容坏了（JSON 解析失败）→ get_profiles 会静默跳过它，
+        # 于是这个文件变成"列表里看不到、命令也删不掉"的死文件。允许按别名把它删掉。
+        broken_path = _broken_profile_path(query)
+        if broken_path:
+            name = os.path.basename(broken_path)[:-5]
+            target = {"path": broken_path, "uid": "", "nickname": "(文件已损坏，读不出账号信息)", "data": {}}
+            profiles = dict(profiles or {})
+            profiles[name] = target
+        else:
+            # 删号是破坏性操作，不接受 UID 前缀这种"猜"出来的匹配
+            prefix_hit, _ = resolve_profile_target(profiles or {}, query, allow_uid_prefix=True, quiet=True)
+            print(f"{COLOR_RED}错误: 没有唯一匹配 '{query}' 的账号。{COLOR_RESET}")
+            if prefix_hit:
+                print(f"  它看起来是 UID 前缀（对应 '{prefix_hit}'），删除请写完整 UID 或别名。")
+            if profiles:
+                print("可用账号: " + ", ".join(profiles.keys()))
+            else:
+                print(f"未在 {PROFILES_DIR} 中发现任何可读的账号文件。")
+            return False
 
     uid = str(target.get("uid") or "").strip()
     target_data = target.get("data")
@@ -1189,7 +1276,7 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
     print(f"\n{COLOR_BOLD}将要删除的账号{COLOR_RESET}")
     print(f"  别名: {COLOR_BOLD}{name}{COLOR_RESET}")
     print(f"  昵称: {target.get('nickname') or '(未知)'}")
-    print(f"  UID : {uid or '(未知)'}")
+    print(f"  UID : {mask_uid(uid)}")
     print(f"  文件: {prof_path}")
 
     if siblings:
@@ -1273,8 +1360,11 @@ def remove_profile(query=None, yes=False, purge=False, dry_run=False, force_acti
             cache.pop(uid, None)
             save_audit_cache(cache)
             print(f"  ✔ 已清掉体检缓存里该账号的记录")
+        # 记一笔：签到任务别把"用户刚删掉的这个号"又自动存回列表
+        _record_tombstone(uid)
     if is_active:
         print(f"  ℹ 客户端的登录态没动，所以状态页仍会把这号显示为当前账号——这是预期，不是残留。")
+        print(f"  ℹ 签到任务也不会再把它自动存回列表；等你哪天重新登录这个账号，它才会重新被收录。")
 
     counts = _count_ownership_rows(uid)
     busy = " / ".join(f"{k} {v} 条" for k, v in counts.items() if v)
@@ -3012,29 +3102,44 @@ def notify_desktop(title, message):
             return False
     return False
 
+def _auto_import_active_profile(active_data, profiles):
+    """把"当前登录但还没入库"的账号自动存成一个 Profile，返回最新的 profiles。
+
+    如果这个号是用户刚用 `workbuddy rm` 手动删掉的（登录态还没刷新），就不存回去——
+    否则第二天定时签到一跑，删掉的账号又出现在列表里，等于"删了等于没删"。
+    """
+    if not active_data or not isinstance(active_data, dict):
+        return profiles
+    acc = active_data.get("account")
+    active_uid = acc.get("uid") if isinstance(acc, dict) else None
+    if not active_uid or any(p["uid"] == active_uid for p in profiles.values()):
+        return profiles
+    if _deleted_recently(active_uid):
+        print(f"{COLOR_YELLOW}ℹ 当前登录的账号 ({mask_uid(active_uid)}) 已被手动删除，跳过自动收录。{COLOR_RESET}")
+        print(f"  重新登录该账号后才会再次自动保存；要彻底退出请在客户端里退出登录。")
+        return profiles
+    nickname = get_display_nickname(acc if isinstance(acc, dict) else {}, default_name=str(active_uid)[:8])
+    clean_name = re.sub(r"[^\w\-]", "_", str(nickname)).strip("_") or str(active_uid)[:8]
+    cand = clean_name
+    idx = 1
+    while os.path.exists(os.path.join(PROFILES_DIR, f"{cand}.info")):
+        cand = f"{clean_name}_{idx}"
+        idx += 1
+    auto_path = os.path.join(PROFILES_DIR, f"{cand}.info")
+    try:
+        atomic_write_json(auto_path, active_data)
+        print(f"{COLOR_GREEN}✔ 检测到新登录账号，已自动保存 Profile: '{cand}' (昵称: {nickname}){COLOR_RESET}")
+        return get_profiles()
+    except Exception:
+        return profiles
+
 def run_checkin(target_name=None, with_chat=True):
     sync_active_token_to_profiles()
     active_data = get_active_account()
     profiles = get_profiles()
 
     # 自动发现：如果当前客户端登录了一个尚未保存到 profiles 的新账号，自动识别并保存入库
-    if active_data:
-        active_uid = active_data.get("account", {}).get("uid") if isinstance(active_data, dict) and isinstance(active_data.get("account"), dict) else None
-        if active_uid and not any(p["uid"] == active_uid for p in profiles.values()):
-            nickname = get_display_nickname(active_data.get("account", {}) if isinstance(active_data, dict) else {}, default_name=str(active_uid)[:8])
-            clean_name = re.sub(r"[^\w\-]", "_", str(nickname)).strip("_") or str(active_uid)[:8]
-            cand = clean_name
-            idx = 1
-            while os.path.exists(os.path.join(PROFILES_DIR, f"{cand}.info")):
-                cand = f"{clean_name}_{idx}"
-                idx += 1
-            auto_path = os.path.join(PROFILES_DIR, f"{cand}.info")
-            try:
-                atomic_write_json(auto_path, active_data)
-                print(f"{COLOR_GREEN}✔ 检测到新登录账号，已自动保存 Profile: '{cand}' (昵称: {nickname}){COLOR_RESET}")
-                profiles = get_profiles()
-            except Exception:
-                pass
+    profiles = _auto_import_active_profile(active_data, profiles)
 
     if not profiles:
         print(f"{COLOR_RED}未在 ~/.workbuddy/auth_profiles 中发现任何保存的账号凭证。{COLOR_RESET}")
